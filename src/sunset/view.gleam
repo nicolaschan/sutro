@@ -1,5 +1,6 @@
 import gleam/int
 import gleam/list
+import gleam/string
 import lustre/attribute.{
   autofocus, class, classes, href, placeholder, type_, value,
 }
@@ -9,19 +10,22 @@ import lustre/element/html.{
 }
 import lustre/event.{on_click, on_input, on_submit}
 import sunset/model.{
-  type Model, type Msg, Dev, Home, UserClickedConnect, UserClickedJoinRoom,
-  UserClickedSend, UserClickedStartAudio, UserClickedStopAudio,
-  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedRoomInput,
+  type Model, type Msg, Dev, Home, RelayConnected, RelayConnecting,
+  RelayDisconnected, RelayFailed, Room, UserClickedConnect, UserClickedJoinRoom,
+  UserClickedLeaveRoom, UserClickedSend, UserClickedStartAudio,
+  UserClickedStopAudio, UserToggledNodeInfo, UserUpdatedChatInput,
+  UserUpdatedMultiaddr, UserUpdatedRoomInput,
 }
 
 pub fn view(model: Model) -> Element(Msg) {
   case model.route {
     Home -> view_home(model)
+    Room(_) -> view_room(model)
     Dev -> view_dev(model)
   }
 }
 
-// -- Home page (new index) --
+// -- Home page (landing) --
 
 fn view_home(model: Model) -> Element(Msg) {
   div([class("landing")], [
@@ -44,6 +48,204 @@ fn view_home(model: Model) -> Element(Msg) {
         ]),
       ]),
       a([href("/dev"), class("landing-link")], [text("Dev dashboard")]),
+    ]),
+  ])
+}
+
+// -- Chat room page --
+
+fn view_room(model: Model) -> Element(Msg) {
+  div([class("room")], [
+    // Sidebar
+    div([class("room-sidebar")], [
+      // Room header (pinned top)
+      div([class("room-sidebar-header")], [
+        button([on_click(UserClickedLeaveRoom), class("room-back")], [
+          text("\u{2190}"),
+        ]),
+        div([class("room-name")], [text(model.room_name)]),
+      ]),
+      // Scrollable middle section
+      div([class("room-sidebar-body")], [
+        // Connection status (clickable to toggle node info)
+        button([on_click(UserToggledNodeInfo), class("room-status")], [
+          span(
+            [
+              classes([
+                #("room-status-dot", True),
+                #("room-status-online", model.relay_status == RelayConnected),
+                #(
+                  "room-status-connecting",
+                  model.relay_status == RelayConnecting
+                    || model.status != "Online",
+                ),
+              ]),
+            ],
+            [],
+          ),
+          span([class("room-status-text")], [
+            text(case model.status, model.relay_status {
+              "Online", RelayConnected -> "Connected"
+              "Online", RelayConnecting -> "Connecting to relay..."
+              "Online", RelayFailed(err) -> "Relay failed: " <> err
+              "Online", RelayDisconnected -> "Ready"
+              _, _ -> model.status
+            }),
+          ]),
+          span([class("room-status-chevron")], [
+            text(case model.show_node_info {
+              True -> "\u{25B4}"
+              False -> "\u{25BE}"
+            }),
+          ]),
+        ]),
+        // Node info panel (collapsible)
+        case model.show_node_info {
+          False -> text("")
+          True ->
+            div([class("room-node-info")], [
+              div([class("room-node-info-row")], [
+                span([class("room-node-info-label")], [text("Peer ID")]),
+                span([class("room-node-info-value")], [
+                  text(case model.peer_id {
+                    "" -> "..."
+                    pid -> pid
+                  }),
+                ]),
+              ]),
+              div([class("room-node-info-row")], [
+                span([class("room-node-info-label")], [
+                  text(
+                    "Addresses ("
+                    <> int.to_string(list.length(model.addresses))
+                    <> ")",
+                  ),
+                ]),
+              ]),
+              case model.addresses {
+                [] ->
+                  div([class("room-node-info-empty")], [
+                    text("No addresses yet"),
+                  ])
+                addrs ->
+                  ul(
+                    [class("room-node-info-addrs")],
+                    list.map(addrs, fn(addr) {
+                      li([class("room-node-info-addr")], [text(addr)])
+                    }),
+                  )
+              },
+            ])
+        },
+        // Peers list
+        div([class("room-peers")], [
+          div([class("room-peers-title")], [
+            text("Connected (" <> int.to_string(model.connection_count) <> ")"),
+          ]),
+          case model.peers {
+            [] -> div([class("room-peers-empty")], [text("No peers yet")])
+            peers ->
+              ul(
+                [class("room-peers-list")],
+                list.map(peers, fn(peer_id) {
+                  li([class("room-peer")], [
+                    span([class("room-peer-dot")], []),
+                    span([class("room-peer-id")], [text(short_peer_id(peer_id))]),
+                  ])
+                }),
+              )
+          },
+        ]),
+      ]),
+      // Voice call controls (pinned bottom)
+      div([class("room-voice")], [
+        case model.audio_sending {
+          True ->
+            button(
+              [
+                on_click(UserClickedStopAudio),
+                class("room-voice-button room-voice-active"),
+              ],
+              [text("Leave call")],
+            )
+          False ->
+            button(
+              [
+                on_click(UserClickedStartAudio),
+                class("room-voice-button"),
+              ],
+              [text("Join voice")],
+            )
+        },
+        div([class("room-voice-status")], [
+          case model.audio_sending {
+            True ->
+              span([class("room-voice-indicator room-voice-indicator-active")], [
+                text("Mic on"),
+              ])
+            False -> text("")
+          },
+          case model.audio_receiving {
+            True ->
+              span([class("room-voice-indicator room-voice-indicator-active")], [
+                text("Receiving"),
+              ])
+            False -> text("")
+          },
+        ]),
+        case model.audio_error {
+          "" -> text("")
+          err -> div([class("room-voice-error")], [text(err)])
+        },
+      ]),
+    ]),
+    // Main chat area
+    div([class("room-main")], [
+      // Messages
+      div([class("room-messages")], case model.messages {
+        [] -> [
+          div([class("room-messages-empty")], [
+            div([class("room-messages-empty-icon")], [text("\u{2600}")]),
+            div([], [text("No messages yet")]),
+            div([class("room-messages-empty-sub")], [
+              text("Say something to get the conversation started"),
+            ]),
+          ]),
+        ]
+        msgs ->
+          list.map(list.reverse(msgs), fn(msg) {
+            div(
+              [
+                classes([
+                  #("room-msg", True),
+                  #("room-msg-self", msg.sender == "You"),
+                  #("room-msg-system", msg.sender == "System"),
+                ]),
+              ],
+              [
+                case msg.sender {
+                  "You" -> text("")
+                  _ -> span([class("room-msg-sender")], [text(msg.sender)])
+                },
+                div([class("room-msg-body")], [text(msg.body)]),
+              ],
+            )
+          })
+      }),
+      // Chat input
+      form([on_submit(fn(_) { UserClickedSend }), class("room-input-bar")], [
+        input([
+          type_("text"),
+          placeholder("Type a message..."),
+          value(model.chat_input),
+          on_input(UserUpdatedChatInput),
+          class("room-chat-input"),
+          autofocus(True),
+        ]),
+        button([type_("submit"), class("room-send-button")], [
+          text("Send"),
+        ]),
+      ]),
     ]),
   ])
 }
@@ -254,4 +456,15 @@ fn view_audio(model: Model) -> Element(Msg) {
       err -> p([class("error-text")], [text(err)])
     },
   ])
+}
+
+// -- Helpers --
+
+fn short_peer_id(peer_id: String) -> String {
+  let len = string.length(peer_id)
+  case len > 12 {
+    True ->
+      string.slice(peer_id, 0, 6) <> ".." <> string.slice(peer_id, len - 4, 4)
+    False -> peer_id
+  }
 }

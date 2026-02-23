@@ -4,15 +4,18 @@ import lustre/effect.{type Effect}
 import sunset/libp2p
 import sunset/model.{
   type Model, type Msg, AudioFailed, AudioStarted, ChatMessage,
-  ChatMessageReceived, DialFailed, DialSucceeded, Libp2pInitialised, Model,
-  RouteChanged, SendFailed, SendSucceeded, Tick, UserClickedConnect,
-  UserClickedJoinRoom, UserClickedSend, UserClickedStartAudio,
-  UserClickedStopAudio, UserUpdatedChatInput, UserUpdatedMultiaddr,
-  UserUpdatedRoomInput,
+  ChatMessageReceived, DialFailed, DialSucceeded, HashChanged, Libp2pInitialised,
+  Model, RelayConnected, RelayConnecting, RelayDialFailed, RelayDialSucceeded,
+  RelayDisconnected, Room, RouteChanged, SendFailed, SendSucceeded, Tick,
+  UserClickedConnect, UserClickedJoinRoom, UserClickedLeaveRoom, UserClickedSend,
+  UserClickedStartAudio, UserClickedStopAudio, UserToggledNodeInfo,
+  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedRoomInput,
 }
 import sunset/nav
 import sunset/router
 import sunset/view
+
+const default_relay = "/dns4/relay.sunset.chat/tcp/443/wss/p2p/12D3KooWCxjbqDBBDsFgEbC3Ft2P3WGCx7NG6ozAeAFGzkXRCQCc"
 
 pub fn main() {
   let app = lustre.application(init, update, view.view)
@@ -24,12 +27,21 @@ pub fn main() {
 // -- MODEL --
 
 fn init(_flags) -> #(Model, Effect(Msg)) {
+  let route = router.init_route()
+  let room_name = case route {
+    Room(name) -> name
+    _ -> ""
+  }
+
   let model =
     Model(
-      route: router.init_route(),
+      route: route,
       room_input: "",
+      room_name: room_name,
       peer_id: "",
       status: "Initialising...",
+      relay_status: RelayDisconnected,
+      show_node_info: False,
       multiaddr_input: "",
       addresses: [],
       peers: [],
@@ -42,7 +54,10 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       audio_error: "",
     )
 
-  #(model, effect.batch([init_libp2p_effect(), router.init()]))
+  #(
+    model,
+    effect.batch([init_libp2p_effect(), router.init(), init_hash_listener()]),
+  )
 }
 
 // -- UPDATE --
@@ -53,6 +68,24 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(Model(..model, route: route), effect.none())
     }
 
+    HashChanged(hash) -> {
+      case hash {
+        "" -> #(Model(..model, route: model.Home, room_name: ""), effect.none())
+        room -> {
+          let new_model = Model(..model, route: Room(room), room_name: room)
+          // If libp2p is ready and relay not connected, auto-dial
+          case model.peer_id, model.relay_status {
+            "", _ -> #(new_model, effect.none())
+            _, RelayDisconnected -> #(
+              Model(..new_model, relay_status: RelayConnecting),
+              dial_relay_effect(),
+            )
+            _, _ -> #(new_model, effect.none())
+          }
+        }
+      }
+    }
+
     UserUpdatedRoomInput(val) -> {
       #(Model(..model, room_input: val), effect.none())
     }
@@ -61,21 +94,56 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let room = string.trim(model.room_input)
       case room {
         "" -> #(model, effect.none())
-        _ -> #(model, set_hash_effect(room))
+        _ -> {
+          let new_model = Model(..model, route: Room(room), room_name: room)
+          // If libp2p is ready and relay not connected, auto-dial
+          case model.peer_id, model.relay_status {
+            "", _ -> #(new_model, set_hash_effect(room))
+            _, RelayDisconnected -> #(
+              Model(..new_model, relay_status: RelayConnecting),
+              effect.batch([set_hash_effect(room), dial_relay_effect()]),
+            )
+            _, _ -> #(new_model, set_hash_effect(room))
+          }
+        }
       }
+    }
+
+    UserClickedLeaveRoom -> {
+      #(
+        Model(..model, route: model.Home, room_name: "", room_input: ""),
+        clear_hash_effect(),
+      )
+    }
+
+    UserToggledNodeInfo -> {
+      #(Model(..model, show_node_info: !model.show_node_info), effect.none())
     }
 
     Libp2pInitialised(peer_id) -> {
       let new_model =
         Model(..model, peer_id: peer_id, status: "Online", error: "")
-      #(
-        new_model,
-        effect.batch([
-          start_polling(),
-          register_chat_effect(),
-          register_signaling_effect(),
-        ]),
-      )
+      // If we're already in a room, auto-dial the relay
+      let effects = [
+        start_polling(),
+        register_chat_effect(),
+        register_signaling_effect(),
+      ]
+      case new_model.room_name {
+        "" -> #(new_model, effect.batch(effects))
+        _ -> #(
+          Model(..new_model, relay_status: RelayConnecting),
+          effect.batch([dial_relay_effect(), ..effects]),
+        )
+      }
+    }
+
+    RelayDialSucceeded -> {
+      #(Model(..model, relay_status: RelayConnected, error: ""), effect.none())
+    }
+
+    RelayDialFailed(err) -> {
+      #(Model(..model, relay_status: model.RelayFailed(err)), effect.none())
     }
 
     UserUpdatedMultiaddr(val) -> {
@@ -178,6 +246,30 @@ fn init_libp2p_effect() -> Effect(Msg) {
   })
 }
 
+fn init_hash_listener() -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    nav.on_hash_change(fn(hash) { dispatch(HashChanged(hash)) })
+  })
+}
+
+fn set_hash_effect(room: String) -> Effect(Msg) {
+  effect.from(fn(_dispatch) { nav.set_hash(room) })
+}
+
+fn clear_hash_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) { nav.clear_hash() })
+}
+
+fn dial_relay_effect() -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    libp2p.dial_multiaddr(
+      default_relay,
+      fn() { dispatch(RelayDialSucceeded) },
+      fn(err) { dispatch(RelayDialFailed(err)) },
+    )
+  })
+}
+
 fn dial_effect(addr: String) -> Effect(Msg) {
   effect.from(fn(dispatch) {
     libp2p.dial_multiaddr(addr, fn() { dispatch(DialSucceeded) }, fn(err) {
@@ -235,8 +327,4 @@ fn short_peer_id(peer_id: String) -> String {
       string.slice(peer_id, 0, 6) <> ".." <> string.slice(peer_id, len - 4, 4)
     False -> peer_id
   }
-}
-
-fn set_hash_effect(room: String) -> Effect(Msg) {
-  effect.from(fn(_dispatch) { nav.set_hash(room) })
 }

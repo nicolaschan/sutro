@@ -22,65 +22,96 @@ import (
 func main() {
 	port := flag.String("port", "4001", "port to listen on")
 	identityPath := flag.String("identity", "identity.key", "path to persistent identity key")
-	certPath := flag.String("certs", "certs", "path to certificate storage")
+	certPath := flag.String("certs", "certs", "path to certificate storage (only used with --autotls)")
 	maxReservations := flag.Int("max-reservations", 256, "max circuit relay reservations")
+	autoTLS := flag.Bool("autotls", false, "enable p2p-forge AutoTLS for libp2p.direct (not needed behind a reverse proxy)")
 	flag.Parse()
 
 	privKey := loadOrCreateIdentity(*identityPath)
 
-	certLoaded := make(chan struct{}, 1)
-
-	certManager, err := p2pforge.NewP2PForgeCertMgr(
-		p2pforge.WithCertificateStorage(&certmagic.FileStorage{Path: *certPath}),
-		p2pforge.WithUserAgent("sunset-relay/0.1.0"),
-		p2pforge.WithOnCertLoaded(func() {
-			select {
-			case certLoaded <- struct{}{}:
-			default:
-			}
-		}),
-	)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create cert manager: %s\n", err)
-		os.Exit(1)
-	}
-	if err := certManager.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start cert manager: %s\n", err)
-		os.Exit(1)
-	}
-	defer certManager.Stop()
-
-	h, err := libp2p.New(
+	// Build libp2p options depending on whether AutoTLS is enabled.
+	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		libp2p.ForceReachabilityPublic(),
 		libp2p.NATPortMap(),
-		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/"+*port,
-			"/ip4/0.0.0.0/udp/"+*port+"/quic-v1",
-			"/ip4/0.0.0.0/udp/"+*port+"/quic-v1/webtransport",
-			"/ip4/0.0.0.0/udp/"+*port+"/webrtc-direct",
-			"/ip6/::/tcp/"+*port,
-			"/ip6/::/udp/"+*port+"/quic-v1",
-			"/ip6/::/udp/"+*port+"/quic-v1/webtransport",
-			"/ip6/::/udp/"+*port+"/webrtc-direct",
-			fmt.Sprintf("/ip4/0.0.0.0/tcp/%s/tls/sni/*.%s/ws", *port, p2pforge.DefaultForgeDomain),
-			fmt.Sprintf("/ip6/::/tcp/%s/tls/sni/*.%s/ws", *port, p2pforge.DefaultForgeDomain),
-		),
 		libp2p.ShareTCPListener(),
 		libp2p.Transport(tcp.NewTCPTransport),
 		libp2p.Transport(quic.NewTransport),
 		libp2p.Transport(webtransport.New),
 		libp2p.Transport(webrtc.New),
-		libp2p.Transport(ws.New, ws.WithTLSConfig(certManager.TLSConfig())),
-		libp2p.AddrsFactory(certManager.AddressFactory()),
-	)
+	}
+
+	// Base listen addresses (shared by both modes).
+	listenAddrs := []string{
+		"/ip4/0.0.0.0/tcp/" + *port,
+		"/ip4/0.0.0.0/udp/" + *port + "/quic-v1",
+		"/ip4/0.0.0.0/udp/" + *port + "/quic-v1/webtransport",
+		"/ip4/0.0.0.0/udp/" + *port + "/webrtc-direct",
+		"/ip6/::/tcp/" + *port,
+		"/ip6/::/udp/" + *port + "/quic-v1",
+		"/ip6/::/udp/" + *port + "/quic-v1/webtransport",
+		"/ip6/::/udp/" + *port + "/webrtc-direct",
+	}
+
+	var certManager *p2pforge.P2PForgeCertMgr
+	var certLoaded chan struct{}
+
+	if *autoTLS {
+		certLoaded = make(chan struct{}, 1)
+
+		var err error
+		certManager, err = p2pforge.NewP2PForgeCertMgr(
+			p2pforge.WithCertificateStorage(&certmagic.FileStorage{Path: *certPath}),
+			p2pforge.WithUserAgent("sunset-relay/0.1.0"),
+			p2pforge.WithOnCertLoaded(func() {
+				select {
+				case certLoaded <- struct{}{}:
+				default:
+				}
+			}),
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create cert manager: %s\n", err)
+			os.Exit(1)
+		}
+		if err := certManager.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start cert manager: %s\n", err)
+			os.Exit(1)
+		}
+		defer certManager.Stop()
+
+		// AutoTLS mode: WSS listeners with TLS/SNI via libp2p.direct
+		listenAddrs = append(listenAddrs,
+			fmt.Sprintf("/ip4/0.0.0.0/tcp/%s/tls/sni/*.%s/ws", *port, p2pforge.DefaultForgeDomain),
+			fmt.Sprintf("/ip6/::/tcp/%s/tls/sni/*.%s/ws", *port, p2pforge.DefaultForgeDomain),
+		)
+		opts = append(opts,
+			libp2p.Transport(ws.New, ws.WithTLSConfig(certManager.TLSConfig())),
+			libp2p.AddrsFactory(certManager.AddressFactory()),
+		)
+	} else {
+		// Plain WS mode: intended for use behind a TLS-terminating reverse proxy.
+		listenAddrs = append(listenAddrs,
+			"/ip4/0.0.0.0/tcp/"+*port+"/ws",
+			"/ip6/::/tcp/"+*port+"/ws",
+		)
+		opts = append(opts,
+			libp2p.Transport(ws.New),
+		)
+	}
+
+	opts = append(opts, libp2p.ListenAddrStrings(listenAddrs...))
+
+	h, err := libp2p.New(opts...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create libp2p host: %s\n", err)
 		os.Exit(1)
 	}
 	defer h.Close()
 
-	certManager.ProvideHost(h)
+	if *autoTLS {
+		certManager.ProvideHost(h)
+	}
 
 	resources := relayv2.DefaultResources()
 	resources.MaxReservations = *maxReservations
@@ -95,13 +126,15 @@ func main() {
 		fmt.Printf("  %s/p2p/%s\n", addr, h.ID())
 	}
 
-	go func() {
-		<-certLoaded
-		fmt.Println("AutoTLS certificate loaded. Updated addresses:")
-		for _, addr := range h.Addrs() {
-			fmt.Printf("  %s/p2p/%s\n", addr, h.ID())
-		}
-	}()
+	if *autoTLS {
+		go func() {
+			<-certLoaded
+			fmt.Println("AutoTLS certificate loaded. Updated addresses:")
+			for _, addr := range h.Addrs() {
+				fmt.Printf("  %s/p2p/%s\n", addr, h.ID())
+			}
+		}()
+	}
 
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)

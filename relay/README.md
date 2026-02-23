@@ -1,8 +1,8 @@
 # Sunset Relay
 
-Minimal libp2p circuit relay server with AutoTLS. Enables browser peers on HTTPS to connect to each other via WSS by relaying through this server, then upgrading to direct WebRTC.
+Minimal libp2p circuit relay server. Enables browser peers on HTTPS to connect to each other via WSS by relaying through this server, then upgrading to direct WebRTC.
 
-Uses [p2p-forge](https://github.com/ipshipyard/p2p-forge) (`libp2p.direct`) for automatic TLS certificates from Let's Encrypt.
+By default the relay listens with **plain WebSocket**, designed to run behind a TLS-terminating reverse proxy (e.g. Traefik, Caddy, nginx). Optionally, pass `--autotls` to use [p2p-forge](https://github.com/ipshipyard/p2p-forge) (`libp2p.direct`) for automatic TLS certificates from Let's Encrypt.
 
 ## Build
 
@@ -19,10 +19,23 @@ docker load < result
 
 ## Run
 
-The relay must run on a host with a **public IP** reachable on port 4001 (TCP+UDP). Use `--network host` so libp2p binds directly to the host's interfaces:
+### Behind a reverse proxy (recommended)
+
+Run the relay behind a TLS-terminating reverse proxy that forwards WebSocket traffic. The relay listens on plain WS on port 4001:
 
 ```bash
 docker run --network host -v sunset-relay-data:/data -it sunset-relay:latest
+```
+
+Configure your reverse proxy to route your domain (e.g. `relay.sunset.chat`) to the relay's WS port. With Traefik, expose the relay container and add the appropriate router/service labels.
+
+### Standalone with AutoTLS
+
+To run without a reverse proxy, use `--autotls` to provision TLS certificates automatically via `libp2p.direct`. The relay must be reachable on the specified port (TCP+UDP):
+
+```bash
+docker run --network host -v sunset-relay-data:/data -it sunset-relay:latest \
+  --autotls --certs /data/certs
 ```
 
 After a few seconds, AutoTLS obtains a wildcard cert and WSS addresses appear:
@@ -46,7 +59,8 @@ docker run --network host -v sunset-relay-data:/data \
 |------|---------|-------------|
 | `--port` | `4001` | TCP/UDP port to listen on |
 | `--identity` | `identity.key` | Path to persistent peer identity key |
-| `--certs` | `certs` | Path to certificate storage directory |
+| `--autotls` | `false` | Enable p2p-forge AutoTLS for `libp2p.direct` (not needed behind a reverse proxy) |
+| `--certs` | `certs` | Path to certificate storage directory (only used with `--autotls`) |
 | `--max-reservations` | `256` | Max concurrent circuit relay reservations |
 
 ## Transports
@@ -55,4 +69,4 @@ docker run --network host -v sunset-relay-data:/data \
 - QUIC v1
 - WebTransport
 - WebRTC-direct
-- WSS via AutoTLS (`*.{peerid}.libp2p.direct`)
+- WS (plain, for use behind a reverse proxy) — or WSS via AutoTLS (`*.{peerid}.libp2p.direct`) with `--autotls`

@@ -46,7 +46,6 @@
               WorkingDir = "/data";
               Cmd = [
                 "--identity" "/data/identity.key"
-                "--certs" "/data/certs"
               ];
             };
           };

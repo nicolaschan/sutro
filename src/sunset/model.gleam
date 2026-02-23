@@ -1,6 +1,14 @@
 pub type Route {
   Home
+  Room(name: String)
   Dev
+}
+
+pub type RelayStatus {
+  RelayDisconnected
+  RelayConnecting
+  RelayConnected
+  RelayFailed(error: String)
 }
 
 pub type ChatMessage {
@@ -11,8 +19,11 @@ pub type Model {
   Model(
     route: Route,
     room_input: String,
+    room_name: String,
     peer_id: String,
     status: String,
+    relay_status: RelayStatus,
+    show_node_info: Bool,
     multiaddr_input: String,
     addresses: List(String),
     peers: List(String),
@@ -28,9 +39,14 @@ pub type Model {
 
 pub type Msg {
   RouteChanged(route: Route)
+  HashChanged(hash: String)
   UserUpdatedRoomInput(value: String)
   UserClickedJoinRoom
+  UserClickedLeaveRoom
+  UserToggledNodeInfo
   Libp2pInitialised(peer_id: String)
+  RelayDialSucceeded
+  RelayDialFailed(error: String)
   UserUpdatedMultiaddr(value: String)
   UserClickedConnect
   DialSucceeded
