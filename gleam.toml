@@ -1,4 +1,4 @@
-name = "sutro"
+name = "sunset"
 version = "1.0.0"
 target = "javascript"
 
@@ -15,4 +15,4 @@ lustre_dev_tools = ">= 2.3.0 and < 3.0.0"
 no_html = true
 
 [[tools.lustre.html.stylesheets]]
-href = "/sutro.css"
+href = "/sunset.css"

@@ -1,5 +1,5 @@
 {
-  description = "Sutro - a Lustre Gleam application";
+  description = "Sunset - a Lustre Gleam application";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -22,7 +22,7 @@
           ];
 
           shellHook = ''
-            echo "sutro dev shell"
+            echo "sunset dev shell"
             echo "  gleam $(gleam --version)"
             echo "  node $(node --version)"
             echo ""
@@ -33,7 +33,7 @@
           '';
         };
 
-        packages.default = pkgs.writeShellScriptBin "sutro-dev" ''
+        packages.default = pkgs.writeShellScriptBin "sunset-dev" ''
           export PATH="${pkgs.lib.makeBinPath (with pkgs; [ gleam erlang rebar3 nodejs inotify-tools ])}:$PATH"
           cd "$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || echo .)"
           echo "Starting Lustre dev server..."
@@ -42,7 +42,7 @@
 
         apps.default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/sutro-dev";
+          program = "${self.packages.${system}.default}/bin/sunset-dev";
         };
       }
     );

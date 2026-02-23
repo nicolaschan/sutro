@@ -6,7 +6,7 @@ import lustre/element/html.{
   a, button, div, h1, h2, hr, input, li, p, section, span, ul,
 }
 import lustre/event.{on_click, on_input}
-import sutro/model.{
+import sunset/model.{
   type Model, type Msg, Dev, Home, UserClickedConnect, UserClickedSend,
   UserClickedStartAudio, UserClickedStopAudio, UserUpdatedChatInput,
   UserUpdatedMultiaddr,
@@ -23,8 +23,8 @@ pub fn view(model: Model) -> Element(Msg) {
 
 fn view_home(_model: Model) -> Element(Msg) {
   div([class("app-container")], [
-    h1([class("app-title")], [text("Sutro")]),
-    p([], [text("Welcome to Sutro -- a peer-to-peer chat app.")]),
+    h1([class("app-title")], [text("Sunset")]),
+    p([], [text("Welcome to Sunset -- a peer-to-peer chat app.")]),
     p([], [
       a([href("/dev")], [text("Dev dashboard")]),
     ]),

@@ -1,4 +1,4 @@
-# Sutro Relay
+# Sunset Relay
 
 Minimal libp2p circuit relay server with AutoTLS. Enables browser peers on HTTPS to connect to each other via WSS by relaying through this server, then upgrading to direct WebRTC.
 
@@ -22,7 +22,7 @@ docker load < result
 The relay must run on a host with a **public IP** reachable on port 4001 (TCP+UDP). Use `--network host` so libp2p binds directly to the host's interfaces:
 
 ```bash
-docker run --network host -v sutro-relay-data:/data -it sutro-relay:latest
+docker run --network host -v sunset-relay-data:/data -it sunset-relay:latest
 ```
 
 After a few seconds, AutoTLS obtains a wildcard cert and WSS addresses appear:
@@ -35,9 +35,9 @@ AutoTLS certificate loaded. Updated addresses:
 ### Debug logging
 
 ```bash
-docker run --network host -v sutro-relay-data:/data \
+docker run --network host -v sunset-relay-data:/data \
   -e GOLOG_LOG_LEVEL="p2p-forge/client=debug" \
-  -it sutro-relay:latest
+  -it sunset-relay:latest
 ```
 
 ## Flags

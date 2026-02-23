@@ -1,5 +1,5 @@
 {
-  description = "Sutro relay - a minimal libp2p circuit relay server with AutoTLS";
+  description = "Sunset relay - a minimal libp2p circuit relay server with AutoTLS";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -11,7 +11,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         relay = pkgs.buildGoModule {
-          pname = "sutro-relay";
+          pname = "sunset-relay";
           version = "0.1.0";
           src = ./.;
           vendorHash = "sha256-pl4GzVBsYjqXnvqC07SmjJEqF8Xp7QlqD9Xpck91x6E=";
@@ -27,7 +27,7 @@
         packages = {
           default = relay;
           docker = pkgs.dockerTools.buildImage {
-            name = "sutro-relay";
+            name = "sunset-relay";
             tag = "latest";
             copyToRoot = pkgs.buildEnv {
               name = "image-root";
@@ -55,7 +55,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [ go gopls ];
           shellHook = ''
-            echo "sutro relay dev shell"
+            echo "sunset relay dev shell"
             echo "  go $(go version | cut -d' ' -f3)"
           '';
         };

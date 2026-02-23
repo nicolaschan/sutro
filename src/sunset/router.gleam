@@ -2,7 +2,7 @@ import gleam/result
 import gleam/uri.{type Uri}
 import lustre/effect.{type Effect}
 import modem
-import sutro/model.{type Msg, type Route, Dev, Home, RouteChanged}
+import sunset/model.{type Msg, type Route, Dev, Home, RouteChanged}
 
 fn on_url_change(uri: Uri) -> Msg {
   let route = case uri.path_segments(uri.path) {

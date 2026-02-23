@@ -120,7 +120,7 @@ export function get_connection_details() {
 
 // -- Chat protocol --
 
-const CHAT_PROTOCOL = "/sutro/chat/1.0.0";
+const CHAT_PROTOCOL = "/sunset/chat/1.0.0";
 let _onChatMessage = null;
 
 // Register the chat protocol handler. Must be called after init_libp2p.
@@ -180,7 +180,7 @@ export function broadcast_message(text, on_ok, on_error) {
 
 // -- Audio (via SDP renegotiation on libp2p's RTCPeerConnection) --
 
-const SIGNALING_PROTOCOL = "/sutro/signaling/1.0.0";
+const SIGNALING_PROTOCOL = "/sunset/signaling/1.0.0";
 
 let _localStream = null;
 let _remoteAudio = null;

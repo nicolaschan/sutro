@@ -1,4 +1,4 @@
-module github.com/nicolaschan/sutro/relay
+module github.com/nicolaschan/sunset/relay
 
 go 1.24.6
 

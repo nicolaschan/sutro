@@ -1,16 +1,16 @@
 import gleam/string
 import lustre
 import lustre/effect.{type Effect}
-import sutro/libp2p
-import sutro/model.{
+import sunset/libp2p
+import sunset/model.{
   type Model, type Msg, AudioFailed, AudioStarted, ChatMessage,
   ChatMessageReceived, DialFailed, DialSucceeded, Libp2pInitialised, Model,
   RouteChanged, SendFailed, SendSucceeded, Tick, UserClickedConnect,
   UserClickedSend, UserClickedStartAudio, UserClickedStopAudio,
   UserUpdatedChatInput, UserUpdatedMultiaddr,
 }
-import sutro/router
-import sutro/view
+import sunset/router
+import sunset/view
 
 pub fn main() {
   let app = lustre.application(init, update, view.view)

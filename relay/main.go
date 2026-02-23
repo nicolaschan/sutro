@@ -32,7 +32,7 @@ func main() {
 
 	certManager, err := p2pforge.NewP2PForgeCertMgr(
 		p2pforge.WithCertificateStorage(&certmagic.FileStorage{Path: *certPath}),
-		p2pforge.WithUserAgent("sutro-relay/0.1.0"),
+		p2pforge.WithUserAgent("sunset-relay/0.1.0"),
 		p2pforge.WithOnCertLoaded(func() {
 			select {
 			case certLoaded <- struct{}{}:

@@ -35,7 +35,7 @@ jobs:
       - run: npm ci
       - run: gleam deps download
       - run: gleam test
-      - run: gleam run -m lustre/dev build sutro --minify
+      - run: gleam run -m lustre/dev build sunset --minify
 
       - uses: actions/upload-pages-artifact@v3
         with:

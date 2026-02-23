@@ -1,24 +1,16 @@
-# sutro
+# sunset
 
-[![Package Version](https://img.shields.io/hexpm/v/sutro)](https://hex.pm/packages/sutro)
-[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/sutro/)
-
-```sh
-gleam add sutro@1
-```
-```gleam
-import sutro
-
-pub fn main() -> Nil {
-  // TODO: An example of the project in use
-}
-```
-
-Further documentation can be found at <https://hexdocs.pm/sutro>.
+Peer-to-peer chat built with [Gleam](https://gleam.run/) + [Lustre](https://lustre.build/) and [libp2p](https://libp2p.io/).
 
 ## Development
 
+Requires [Nix](https://nixos.org/) with flakes enabled.
+
 ```sh
-gleam run   # Run the project
-gleam test  # Run the tests
+nix run          # Start the Lustre dev server
+gleam test       # Run the tests
 ```
+
+## Deployment
+
+Deployed to GitHub Pages via CI on push to `main`/`master`.
