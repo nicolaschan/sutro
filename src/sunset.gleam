@@ -17,7 +17,7 @@ import sunset/nav
 import sunset/router
 import sunset/view
 
-const default_relay = "/ip4/127.0.0.1/tcp/4001/ws/p2p/12D3KooWCxjbqDBBDsFgEbC3Ft2P3WGCx7NG6ozAeAFGzkXRCQCc"
+const default_relay = "/dns/relay.sunset.chat/tcp/443/wss/p2p/12D3KooWAvzBJHKbkWkn3qVH7DdhyJCNFLxQFUrpUFWYueVKzrNY"
 
 pub fn main() {
   let app = lustre.application(init, update, view.view)
