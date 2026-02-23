@@ -52,14 +52,10 @@
       {
         packages = {
           default = relay;
-          docker = pkgs.dockerTools.buildImage {
+          docker = pkgs.dockerTools.buildLayeredImage {
             name = "sunset-relay";
             tag = "latest";
-            copyToRoot = pkgs.buildEnv {
-              name = "image-root";
-              paths = [ relay pkgs.cacert ];
-              pathsToLink = [ "/bin" "/etc/ssl" ];
-            };
+            contents = [ relay pkgs.cacert ];
             config = {
               Entrypoint = [ "${relay}/bin/relay" ];
               ExposedPorts = {

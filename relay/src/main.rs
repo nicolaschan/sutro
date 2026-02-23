@@ -20,7 +20,7 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{fs, signal, sync::Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -243,13 +243,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ..
                         },
                     )) => {
-                        info!(
+                        debug!(
                             "Discovery request from {peer}: room={} addrs={}",
                             request.room,
                             request.addrs.len()
                         );
                         let response = handle_discovery(&registry, request).await;
-                        info!("Responding with {} peers", response.peers.len());
+                        debug!("Responding with {} peers", response.peers.len());
                         if swarm
                             .behaviour_mut()
                             .discovery
