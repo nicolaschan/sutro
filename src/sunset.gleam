@@ -1,3 +1,4 @@
+import gleam/list
 import gleam/string
 import lustre
 import lustre/effect.{type Effect}
@@ -5,9 +6,10 @@ import sunset/libp2p
 import sunset/model.{
   type Model, type Msg, AudioFailed, AudioStarted, ChatMessage,
   ChatMessageReceived, DialFailed, DialSucceeded, HashChanged, Libp2pInitialised,
-  Model, RelayConnected, RelayConnecting, RelayDialFailed, RelayDialSucceeded,
-  RelayDisconnected, Room, RouteChanged, SendFailed, SendSucceeded, Tick,
-  UserClickedConnect, UserClickedJoinRoom, UserClickedLeaveRoom, UserClickedSend,
+  Model, PeerDialFailed, PeerDialSucceeded, PeerDiscovered, RelayConnected,
+  RelayConnecting, RelayDialFailed, RelayDialSucceeded, RelayDisconnected, Room,
+  RouteChanged, SendFailed, SendSucceeded, Tick, UserClickedConnect,
+  UserClickedJoinRoom, UserClickedLeaveRoom, UserClickedSend,
   UserClickedStartAudio, UserClickedStopAudio, UserToggledNodeInfo,
   UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedRoomInput,
 }
@@ -15,7 +17,7 @@ import sunset/nav
 import sunset/router
 import sunset/view
 
-const default_relay = "/dns/relay.sunset.chat/tcp/443/wss/p2p/12D3KooWAvzBJHKbkWkn3qVH7DdhyJCNFLxQFUrpUFWYueVKzrNY"
+const default_relay = "/ip4/127.0.0.1/tcp/4001/ws/p2p/12D3KooWCxjbqDBBDsFgEbC3Ft2P3WGCx7NG6ozAeAFGzkXRCQCc"
 
 pub fn main() {
   let app = lustre.application(init, update, view.view)
@@ -70,7 +72,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     HashChanged(hash) -> {
       case hash {
-        "" -> #(Model(..model, route: model.Home, room_name: ""), effect.none())
+        "" -> #(
+          Model(..model, route: model.Home, room_name: ""),
+          unsubscribe_from_room_effect(),
+        )
         room -> {
           let new_model = Model(..model, route: Room(room), room_name: room)
           // If libp2p is ready and relay not connected, auto-dial
@@ -80,6 +85,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               Model(..new_model, relay_status: RelayConnecting),
               dial_relay_effect(),
             )
+            _, RelayConnected -> #(new_model, subscribe_to_room_effect(room))
             _, _ -> #(new_model, effect.none())
           }
         }
@@ -103,6 +109,13 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               Model(..new_model, relay_status: RelayConnecting),
               effect.batch([set_hash_effect(room), dial_relay_effect()]),
             )
+            _, RelayConnected -> #(
+              new_model,
+              effect.batch([
+                set_hash_effect(room),
+                subscribe_to_room_effect(room),
+              ]),
+            )
             _, _ -> #(new_model, set_hash_effect(room))
           }
         }
@@ -112,7 +125,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     UserClickedLeaveRoom -> {
       #(
         Model(..model, route: model.Home, room_name: "", room_input: ""),
-        clear_hash_effect(),
+        effect.batch([clear_hash_effect(), unsubscribe_from_room_effect()]),
       )
     }
 
@@ -139,7 +152,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
 
     RelayDialSucceeded -> {
-      #(Model(..model, relay_status: RelayConnected, error: ""), effect.none())
+      case model.room_name {
+        "" -> #(
+          Model(..model, relay_status: RelayConnected, error: ""),
+          effect.none(),
+        )
+        room -> #(
+          Model(..model, relay_status: RelayConnected, error: ""),
+          subscribe_to_room_effect(room),
+        )
+      }
     }
 
     RelayDialFailed(err) -> {
@@ -235,6 +257,25 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     AudioFailed(err) -> {
       #(Model(..model, audio_sending: False, audio_error: err), effect.none())
     }
+
+    PeerDiscovered(peer_id, addrs) -> {
+      // Only dial if we're not already connected to this peer
+      case list.contains(model.peers, peer_id) {
+        True -> #(model, effect.none())
+        False -> #(model, dial_peer_addrs_effect(addrs))
+      }
+    }
+
+    PeerDialSucceeded -> {
+      // The polling tick will pick up the new connection
+      #(model, effect.none())
+    }
+
+    PeerDialFailed(_err) -> {
+      // Discovery dial failures are expected (stale addresses, NAT issues).
+      // Don't surface to the user.
+      #(model, effect.none())
+    }
   }
 }
 
@@ -318,6 +359,26 @@ fn start_audio_effect() -> Effect(Msg) {
 
 fn stop_audio_effect() -> Effect(Msg) {
   effect.from(fn(_dispatch) { libp2p.stop_audio() })
+}
+
+fn subscribe_to_room_effect(room: String) -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    libp2p.subscribe_to_room(room, fn(peer_id, addrs) {
+      dispatch(PeerDiscovered(peer_id, addrs))
+    })
+  })
+}
+
+fn unsubscribe_from_room_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) { libp2p.unsubscribe_from_room() })
+}
+
+fn dial_peer_addrs_effect(addrs: List(String)) -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    libp2p.dial_peer_addrs(addrs, fn() { dispatch(PeerDialSucceeded) }, fn(err) {
+      dispatch(PeerDialFailed(err))
+    })
+  })
 }
 
 fn short_peer_id(peer_id: String) -> String {

@@ -1,26 +1,30 @@
 use std::{
-    hash::{DefaultHasher, Hash, Hasher},
+    collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
     path::PathBuf,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::{
     core::multiaddr::Protocol,
-    gossipsub, identify, identity,
+    identify, identity,
     multiaddr::Multiaddr,
-    noise, relay,
+    noise,
+    relay,
+    request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
+    tcp, yamux, PeerId, StreamProtocol,
 };
-use tokio::{fs, signal};
+use serde::{Deserialize, Serialize};
+use tokio::{fs, signal, sync::Mutex};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "sunset-relay", about = "Minimal libp2p circuit relay with gossipsub")]
+#[command(name = "sunset-relay", about = "Minimal libp2p circuit relay with room-based peer discovery")]
 struct Opt {
     /// Port to listen on
     #[arg(long, default_value = "4001")]
@@ -35,11 +39,95 @@ struct Opt {
     max_reservations: u32,
 }
 
+// -- Discovery protocol types --
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscoveryRequest {
+    room: String,
+    peer_id: String,
+    addrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerInfo {
+    peer_id: String,
+    addrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscoveryResponse {
+    peers: Vec<PeerInfo>,
+}
+
+// -- Room registry --
+
+struct PeerEntry {
+    addrs: Vec<String>,
+    last_seen: Instant,
+}
+
+type RoomRegistry = Arc<Mutex<HashMap<String, HashMap<String, PeerEntry>>>>;
+
+const PEER_TTL: Duration = Duration::from_secs(30);
+
+async fn handle_discovery(
+    registry: &RoomRegistry,
+    req: DiscoveryRequest,
+) -> DiscoveryResponse {
+    let mut rooms = registry.lock().await;
+
+    // Expire stale entries in this room
+    let now = Instant::now();
+    if let Some(room) = rooms.get_mut(&req.room) {
+        room.retain(|_, entry| now.duration_since(entry.last_seen) < PEER_TTL);
+    }
+
+    // Insert/update the requesting peer
+    let room = rooms.entry(req.room.clone()).or_default();
+    room.insert(
+        req.peer_id.clone(),
+        PeerEntry {
+            addrs: req.addrs,
+            last_seen: now,
+        },
+    );
+
+    // Collect all other peers in the room
+    let peers: Vec<PeerInfo> = room
+        .iter()
+        .filter(|(pid, _)| *pid != &req.peer_id)
+        .map(|(pid, entry)| PeerInfo {
+            peer_id: pid.clone(),
+            addrs: entry.addrs.clone(),
+        })
+        .collect();
+
+    DiscoveryResponse { peers }
+}
+
+/// Clean up a peer from all rooms when they disconnect.
+async fn remove_peer(registry: &RoomRegistry, peer_id: &PeerId) {
+    let peer_str = peer_id.to_string();
+    let mut rooms = registry.lock().await;
+    let mut empty_rooms = Vec::new();
+    for (room_name, peers) in rooms.iter_mut() {
+        peers.remove(&peer_str);
+        if peers.is_empty() {
+            empty_rooms.push(room_name.clone());
+        }
+    }
+    for room_name in empty_rooms {
+        rooms.remove(&room_name);
+    }
+}
+
+// -- libp2p behaviour --
+
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     relay: relay::Behaviour,
     identify: identify::Behaviour,
-    gossipsub: gossipsub::Behaviour,
+    discovery: request_response::json::Behaviour<DiscoveryRequest, DiscoveryResponse>,
 }
 
 #[tokio::main]
@@ -56,34 +144,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local_peer_id = local_key.public().to_peer_id();
 
     info!("Local PeerID: {local_peer_id}");
-
-    // Configure gossipsub
-    let message_id_fn = |message: &gossipsub::Message| {
-        let mut s = DefaultHasher::new();
-        message.data.hash(&mut s);
-        message.source.hash(&mut s);
-        message.sequence_number.hash(&mut s);
-        gossipsub::MessageId::from(s.finish().to_string())
-    };
-
-    let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(Duration::from_secs(1))
-        .validation_mode(gossipsub::ValidationMode::Permissive)
-        .message_id_fn(message_id_fn)
-        .build()
-        .map_err(|e| format!("gossipsub config error: {e}"))?;
-
-    let mut gossipsub = gossipsub::Behaviour::new(
-        gossipsub::MessageAuthenticity::Signed(local_key.clone()),
-        gossipsub_config,
-    )
-    .map_err(|e| format!("gossipsub error: {e}"))?;
-
-    // Subscribe to the global discovery topic so we participate in the mesh
-    // and forward messages between browser peers.
-    let discovery_topic = gossipsub::IdentTopic::new("/sunset/discovery");
-    gossipsub.subscribe(&discovery_topic)?;
-    info!("Subscribed to /sunset/discovery");
 
     // Configure relay with reservation limits
     let relay_config = relay::Config {
@@ -108,15 +168,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/sunset-relay/0.1.0".to_string(),
                 key.public(),
             )),
-            gossipsub,
+            discovery: request_response::json::Behaviour::new(
+                [(
+                    StreamProtocol::new("/sunset/discovery/1.0.0"),
+                    ProtocolSupport::Full,
+                )],
+                request_response::Config::default(),
+            ),
         })?
         .build();
 
     // Listen on all interfaces — WebSocket (for browsers) and QUIC (for native peers)
-    // Note: We don't listen on plain TCP separately because rust-libp2p's WebSocket
-    // transport creates its own TCP listener. The Go relay used ShareTCPListener() to
-    // share a port; rust-libp2p doesn't have that, so we only listen on WS (which uses
-    // TCP underneath) and QUIC. Browsers connect via WS/WSS (through a reverse proxy).
     let port = opt.port;
 
     // WebSocket over TCP (IPv4 + IPv6) — browsers connect here
@@ -149,6 +211,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Relay listening on port {port}");
 
+    let registry: RoomRegistry = Arc::new(Mutex::new(HashMap::new()));
+
     // Event loop
     loop {
         tokio::select! {
@@ -168,32 +232,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )) => {
                         info!("Relay reservation accepted for {src_peer_id}");
                     }
-                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-                        gossipsub::Event::Message { message, .. },
+                    SwarmEvent::Behaviour(BehaviourEvent::Discovery(
+                        request_response::Event::Message {
+                            peer,
+                            message: request_response::Message::Request {
+                                request,
+                                channel,
+                                ..
+                            },
+                            ..
+                        },
                     )) => {
-                        // We receive messages on /sunset/discovery but don't need to
-                        // process them — gossipsub automatically forwards to mesh peers.
                         info!(
-                            "Discovery message from {:?} ({} bytes)",
-                            message.source,
-                            message.data.len()
+                            "Discovery request from {peer}: room={} addrs={}",
+                            request.room,
+                            request.addrs.len()
                         );
-                    }
-                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-                        gossipsub::Event::Subscribed { peer_id, topic },
-                    )) => {
-                        info!("Peer {peer_id} subscribed to {topic}");
-                    }
-                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-                        gossipsub::Event::Unsubscribed { peer_id, topic },
-                    )) => {
-                        info!("Peer {peer_id} unsubscribed from {topic}");
+                        let response = handle_discovery(&registry, request).await;
+                        info!("Responding with {} peers", response.peers.len());
+                        if swarm
+                            .behaviour_mut()
+                            .discovery
+                            .send_response(channel, response)
+                            .is_err()
+                        {
+                            warn!("Failed to send discovery response to {peer}");
+                        }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         info!("Connection established with {peer_id} via {}", endpoint.get_remote_address());
                     }
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                         info!("Connection closed with {peer_id}: {cause:?}");
+                        remove_peer(&registry, &peer_id).await;
                     }
                     _ => {}
                 }

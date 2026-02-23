@@ -70,3 +70,25 @@ pub fn is_audio_active() -> Bool {
 pub fn is_receiving_audio() -> Bool {
   False
 }
+
+@external(javascript, "./libp2p.ffi.mjs", "subscribe_to_room")
+pub fn subscribe_to_room(
+  _room: String,
+  _on_peer_discovered: fn(String, List(String)) -> Nil,
+) -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "unsubscribe_from_room")
+pub fn unsubscribe_from_room() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "dial_peer_addrs")
+pub fn dial_peer_addrs(
+  _addrs: List(String),
+  _on_ok: fn() -> Nil,
+  _on_error: fn(String) -> Nil,
+) -> Nil {
+  Nil
+}

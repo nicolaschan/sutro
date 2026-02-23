@@ -400,3 +400,209 @@ export function is_receiving_audio() {
   const tracks = _remoteAudio.srcObject.getAudioTracks();
   return tracks.some((t) => t.readyState === "live");
 }
+
+// -- Room-based peer discovery via relay --
+//
+// The relay runs a custom request-response protocol (/sunset/discovery/1.0.0).
+// We periodically open a stream, send our room + addresses, and receive back
+// all other peers in that room. The relay uses libp2p-request-response with
+// JSON codec, which frames messages as: <unsigned-varint-length><json-bytes>.
+
+const DISCOVERY_PROTOCOL = "/sunset/discovery/1.0.0";
+const DISCOVERY_POLL_MS = 10_000;
+
+let _discoveryRoom = null;
+let _discoveryInterval = null;
+let _onPeerDiscovered = null;
+
+// Encode an unsigned varint (used by libp2p length-prefixed framing).
+function encodeUvarint(value) {
+  const bytes = [];
+  while (value >= 0x80) {
+    bytes.push((value & 0x7f) | 0x80);
+    value >>>= 7;
+  }
+  bytes.push(value & 0x7f);
+  return new Uint8Array(bytes);
+}
+
+// Decode an unsigned varint from a Uint8Array, returning [value, bytesRead].
+function decodeUvarint(buf, offset = 0) {
+  let value = 0;
+  let shift = 0;
+  let i = offset;
+  while (i < buf.length) {
+    const byte = buf[i];
+    value |= (byte & 0x7f) << shift;
+    i++;
+    if ((byte & 0x80) === 0) return [value, i - offset];
+    shift += 7;
+    if (shift > 35) throw new Error("varint too long");
+  }
+  throw new Error("varint incomplete");
+}
+
+// Write a length-prefixed JSON message to a libp2p stream.
+function writeLengthPrefixed(stream, obj) {
+  const json = new TextEncoder().encode(JSON.stringify(obj));
+  const lenBytes = encodeUvarint(json.length);
+  const frame = new Uint8Array(lenBytes.length + json.length);
+  frame.set(lenBytes, 0);
+  frame.set(json, lenBytes.length);
+  stream.send(frame);
+}
+
+// Read a full length-prefixed JSON message from a libp2p stream.
+async function readLengthPrefixed(stream) {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk.subarray());
+  }
+  if (chunks.length === 0) throw new Error("Empty response");
+  const buf = new Uint8Array(chunks.reduce((a, c) => a + c.length, 0));
+  let offset = 0;
+  for (const c of chunks) {
+    buf.set(c, offset);
+    offset += c.length;
+  }
+  const [len, varintSize] = decodeUvarint(buf);
+  const json = new TextDecoder().decode(buf.slice(varintSize, varintSize + len));
+  return JSON.parse(json);
+}
+
+// Read raw JSON from a libp2p stream until EOF (remote half-close).
+// Used with rust-libp2p request_response::json codec which has no length-prefix.
+async function readRawJson(stream) {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk.subarray());
+  }
+  if (chunks.length === 0) throw new Error("Empty response");
+  const buf = new Uint8Array(chunks.reduce((a, c) => a + c.length, 0));
+  let offset = 0;
+  for (const c of chunks) {
+    buf.set(c, offset);
+    offset += c.length;
+  }
+  return JSON.parse(new TextDecoder().decode(buf));
+}
+
+// Subscribe to a room for peer discovery. Polls the relay periodically.
+// on_discovered(peer_id, addrs_gleam_list) is called for each discovered peer.
+export function subscribe_to_room(room_name, on_discovered) {
+  if (!_libp2p) return;
+
+  // Unsubscribe first if already subscribed
+  unsubscribe_from_room();
+
+  _discoveryRoom = room_name;
+  _onPeerDiscovered = on_discovered;
+
+  // Poll immediately, then on interval
+  _pollDiscovery();
+  _discoveryInterval = setInterval(_pollDiscovery, DISCOVERY_POLL_MS);
+}
+
+// Unsubscribe from room discovery.
+export function unsubscribe_from_room() {
+  if (_discoveryInterval) {
+    clearInterval(_discoveryInterval);
+    _discoveryInterval = null;
+  }
+  _discoveryRoom = null;
+  _onPeerDiscovered = null;
+}
+
+// Send a discovery request to the relay and process the response.
+async function _pollDiscovery() {
+  if (!_libp2p || !_discoveryRoom) return;
+
+  const relayPeerId = _getRelayPeerId();
+  if (!relayPeerId) {
+    console.debug("Discovery poll: no relay connection yet");
+    return;
+  }
+
+  try {
+    const addrs = _libp2p.getMultiaddrs().map((ma) => ma.toString());
+    const request = {
+      room: _discoveryRoom,
+      peer_id: _libp2p.peerId.toString(),
+      addrs,
+    };
+
+    const stream = await _libp2p.dialProtocol(relayPeerId, DISCOVERY_PROTOCOL);
+    // rust-libp2p request_response::json codec uses raw JSON + read-to-EOF
+    // (no length-prefix framing). Half-close signals end of request.
+    const json = new TextEncoder().encode(JSON.stringify(request));
+    stream.send(json);
+    await stream.close();
+
+    const response = await readRawJson(stream);
+
+    if (response.peers && _onPeerDiscovered) {
+      for (const peer of response.peers) {
+        if (peer.peer_id !== _libp2p.peerId.toString()) {
+          _onPeerDiscovered(peer.peer_id, toList(peer.addrs));
+        }
+      }
+    }
+  } catch (err) {
+    console.debug("Discovery poll failed:", err.message);
+  }
+}
+
+// Get the PeerId of the connected relay (first peer that has a non-WebRTC connection).
+function _getRelayPeerId() {
+  if (!_libp2p) return null;
+  for (const conn of _libp2p.getConnections()) {
+    const ma = conn.remoteAddr;
+    // The relay connection is via WebSocket (not WebRTC/circuit)
+    if (
+      WebSockets.exactMatch(ma) ||
+      WebSocketsSecure.exactMatch(ma) ||
+      WebTransport.exactMatch(ma)
+    ) {
+      return conn.remotePeer;
+    }
+  }
+  return null;
+}
+
+// Dial a peer given a list of multiaddr strings. Tries each address
+// sequentially until one succeeds. Calls on_ok() on first success,
+// on_error(msg) if all fail.
+export function dial_peer_addrs(addrs_list, on_ok, on_error) {
+  if (!_libp2p) {
+    on_error("libp2p not initialised");
+    return;
+  }
+
+  // Convert Gleam list to JS array
+  const addrs = [];
+  let cursor = addrs_list;
+  while (cursor.head !== undefined) {
+    addrs.push(cursor.head);
+    cursor = cursor.tail;
+  }
+
+  if (addrs.length === 0) {
+    on_error("No addresses to dial");
+    return;
+  }
+
+  (async () => {
+    const errors = [];
+    for (const addr of addrs) {
+      try {
+        const ma = multiaddr(addr);
+        await _libp2p.dial(ma);
+        on_ok();
+        return;
+      } catch (err) {
+        errors.push(`${addr}: ${err.message}`);
+      }
+    }
+    on_error("All addresses failed: " + errors.join("; "));
+  })();
+}

@@ -61,4 +61,7 @@ pub type Msg {
   UserClickedStopAudio
   AudioStarted
   AudioFailed(error: String)
+  PeerDiscovered(peer_id: String, addrs: List(String))
+  PeerDialSucceeded
+  PeerDialFailed(error: String)
 }
