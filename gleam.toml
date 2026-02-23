@@ -14,5 +14,29 @@ lustre_dev_tools = ">= 2.3.0 and < 3.0.0"
 [tools.lustre.build]
 no_html = true
 
+[tools.lustre.html]
+title = "Sunset"
+
+[[tools.lustre.html.links]]
+rel = "icon"
+href = "/favicon.svg"
+type = "image/svg+xml"
+
+[[tools.lustre.html.links]]
+rel = "preconnect"
+href = "https://fonts.googleapis.com"
+
+[[tools.lustre.html.links]]
+rel = "preconnect"
+href = "https://fonts.gstatic.com"
+crossorigin = ""
+
+[[tools.lustre.html.links]]
+rel = "stylesheet"
+href = "https://fonts.googleapis.com/css2?family=Nunito:wght@300;400;500;600;700&display=swap"
+
 [[tools.lustre.html.stylesheets]]
 href = "/sunset.css"
+
+[[tools.lustre.html.stylesheets]]
+href = "/dev.css"

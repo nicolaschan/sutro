@@ -1,15 +1,17 @@
 import gleam/int
 import gleam/list
-import lustre/attribute.{class, classes, href, placeholder, type_, value}
+import lustre/attribute.{
+  autofocus, class, classes, href, placeholder, type_, value,
+}
 import lustre/element.{type Element, text}
 import lustre/element/html.{
-  a, button, div, h1, h2, hr, input, li, p, section, span, ul,
+  a, button, div, form, h1, h2, hr, input, li, p, section, span, ul,
 }
-import lustre/event.{on_click, on_input}
+import lustre/event.{on_click, on_input, on_submit}
 import sunset/model.{
-  type Model, type Msg, Dev, Home, UserClickedConnect, UserClickedSend,
-  UserClickedStartAudio, UserClickedStopAudio, UserUpdatedChatInput,
-  UserUpdatedMultiaddr,
+  type Model, type Msg, Dev, Home, UserClickedConnect, UserClickedJoinRoom,
+  UserClickedSend, UserClickedStartAudio, UserClickedStopAudio,
+  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedRoomInput,
 }
 
 pub fn view(model: Model) -> Element(Msg) {
@@ -21,12 +23,27 @@ pub fn view(model: Model) -> Element(Msg) {
 
 // -- Home page (new index) --
 
-fn view_home(_model: Model) -> Element(Msg) {
-  div([class("app-container")], [
-    h1([class("app-title")], [text("Sunset")]),
-    p([], [text("Welcome to Sunset -- a peer-to-peer chat app.")]),
-    p([], [
-      a([href("/dev")], [text("Dev dashboard")]),
+fn view_home(model: Model) -> Element(Msg) {
+  div([class("landing")], [
+    div([class("landing-glow")], []),
+    div([class("landing-content")], [
+      div([class("landing-sun")], []),
+      h1([class("landing-title")], [text("Sunset Chat")]),
+      div([class("landing-horizon")], []),
+      form([on_submit(fn(_) { UserClickedJoinRoom }), class("room-form")], [
+        input([
+          type_("text"),
+          placeholder("Room name"),
+          value(model.room_input),
+          on_input(UserUpdatedRoomInput),
+          class("room-input"),
+          autofocus(True),
+        ]),
+        button([type_("submit"), class("room-button")], [
+          text("Join"),
+        ]),
+      ]),
+      a([href("/dev"), class("landing-link")], [text("Dev dashboard")]),
     ]),
   ])
 }
@@ -34,51 +51,55 @@ fn view_home(_model: Model) -> Element(Msg) {
 // -- Dev page (original index) --
 
 fn view_dev(model: Model) -> Element(Msg) {
-  div([class("app-container")], [
-    h1([class("app-title")], [text("Dev Dashboard")]),
-    p([], [a([href("/")], [text("Back to home")])]),
-    // Node info section
-    section([class("app-section")], [
-      h2([class("section-title")], [text("Node")]),
-      view_node_info(model),
-    ]),
-    hr([class("app-divider")]),
-    // Connect section
-    section([class("app-section")], [
-      h2([class("section-title")], [text("Connect to Peer")]),
-      view_connect_form(model),
-    ]),
-    hr([class("app-divider")]),
-    // Addresses section
-    section([class("app-section")], [
-      h2([class("section-title")], [
-        text(
-          "My Addresses (" <> int.to_string(list.length(model.addresses)) <> ")",
-        ),
+  div([class("page-dev")], [
+    div([class("app-container")], [
+      h1([class("app-title")], [text("Dev Dashboard")]),
+      p([], [a([href("/")], [text("Back to home")])]),
+      // Node info section
+      section([class("app-section")], [
+        h2([class("section-title")], [text("Node")]),
+        view_node_info(model),
       ]),
-      view_addresses(model),
-    ]),
-    hr([class("app-divider")]),
-    // Connected peers section
-    section([class("app-section")], [
-      h2([class("section-title")], [
-        text(
-          "Connected Peers (" <> int.to_string(model.connection_count) <> ")",
-        ),
+      hr([class("app-divider")]),
+      // Connect section
+      section([class("app-section")], [
+        h2([class("section-title")], [text("Connect to Peer")]),
+        view_connect_form(model),
       ]),
-      view_peers(model),
-    ]),
-    hr([class("app-divider")]),
-    // Chat section
-    section([], [
-      h2([class("section-title")], [text("Chat")]),
-      view_chat(model),
-    ]),
-    hr([class("app-divider")]),
-    // Audio section
-    section([class("app-section")], [
-      h2([class("section-title")], [text("Audio")]),
-      view_audio(model),
+      hr([class("app-divider")]),
+      // Addresses section
+      section([class("app-section")], [
+        h2([class("section-title")], [
+          text(
+            "My Addresses ("
+            <> int.to_string(list.length(model.addresses))
+            <> ")",
+          ),
+        ]),
+        view_addresses(model),
+      ]),
+      hr([class("app-divider")]),
+      // Connected peers section
+      section([class("app-section")], [
+        h2([class("section-title")], [
+          text(
+            "Connected Peers (" <> int.to_string(model.connection_count) <> ")",
+          ),
+        ]),
+        view_peers(model),
+      ]),
+      hr([class("app-divider")]),
+      // Chat section
+      section([], [
+        h2([class("section-title")], [text("Chat")]),
+        view_chat(model),
+      ]),
+      hr([class("app-divider")]),
+      // Audio section
+      section([class("app-section")], [
+        h2([class("section-title")], [text("Audio")]),
+        view_audio(model),
+      ]),
     ]),
   ])
 }

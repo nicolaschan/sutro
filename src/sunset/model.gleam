@@ -10,6 +10,7 @@ pub type ChatMessage {
 pub type Model {
   Model(
     route: Route,
+    room_input: String,
     peer_id: String,
     status: String,
     multiaddr_input: String,
@@ -27,6 +28,8 @@ pub type Model {
 
 pub type Msg {
   RouteChanged(route: Route)
+  UserUpdatedRoomInput(value: String)
+  UserClickedJoinRoom
   Libp2pInitialised(peer_id: String)
   UserUpdatedMultiaddr(value: String)
   UserClickedConnect

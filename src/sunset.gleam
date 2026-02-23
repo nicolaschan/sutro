@@ -6,9 +6,11 @@ import sunset/model.{
   type Model, type Msg, AudioFailed, AudioStarted, ChatMessage,
   ChatMessageReceived, DialFailed, DialSucceeded, Libp2pInitialised, Model,
   RouteChanged, SendFailed, SendSucceeded, Tick, UserClickedConnect,
-  UserClickedSend, UserClickedStartAudio, UserClickedStopAudio,
-  UserUpdatedChatInput, UserUpdatedMultiaddr,
+  UserClickedJoinRoom, UserClickedSend, UserClickedStartAudio,
+  UserClickedStopAudio, UserUpdatedChatInput, UserUpdatedMultiaddr,
+  UserUpdatedRoomInput,
 }
+import sunset/nav
 import sunset/router
 import sunset/view
 
@@ -25,6 +27,7 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
   let model =
     Model(
       route: router.init_route(),
+      room_input: "",
       peer_id: "",
       status: "Initialising...",
       multiaddr_input: "",
@@ -48,6 +51,18 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     RouteChanged(route) -> {
       #(Model(..model, route: route), effect.none())
+    }
+
+    UserUpdatedRoomInput(val) -> {
+      #(Model(..model, room_input: val), effect.none())
+    }
+
+    UserClickedJoinRoom -> {
+      let room = string.trim(model.room_input)
+      case room {
+        "" -> #(model, effect.none())
+        _ -> #(model, set_hash_effect(room))
+      }
     }
 
     Libp2pInitialised(peer_id) -> {
@@ -220,4 +235,8 @@ fn short_peer_id(peer_id: String) -> String {
       string.slice(peer_id, 0, 6) <> ".." <> string.slice(peer_id, len - 4, 4)
     False -> peer_id
   }
+}
+
+fn set_hash_effect(room: String) -> Effect(Msg) {
+  effect.from(fn(_dispatch) { nav.set_hash(room) })
 }
