@@ -50,7 +50,9 @@ export function init_libp2p(dispatch) {
       _libp2p = libp2p;
       globalThis.libp2p = libp2p;
 
-      libp2p.addEventListener("peer:connect", () => {});
+      libp2p.addEventListener("peer:connect", (event) => {
+        addTrackToNewPeer(event.detail);
+      });
       libp2p.addEventListener("peer:disconnect", () => {});
 
       dispatch(libp2p.peerId.toString());
@@ -213,6 +215,66 @@ function getWebRTCPeers() {
     results.push({ peerId, pc, conn });
   }
   return results;
+}
+
+// When a new peer connects while we're already broadcasting audio, add our
+// audio track to their RTCPeerConnection.  The WebRTC transport upgrade may
+// not be complete when peer:connect fires, so we retry a few times.
+function addTrackToNewPeer(remotePeerId) {
+  if (!_localStream) return; // not broadcasting
+  const track = _localStream.getAudioTracks()[0];
+  if (!track) return;
+
+  let attempts = 0;
+  const maxAttempts = 10;
+  const intervalMs = 500;
+
+  const timer = setInterval(() => {
+    attempts++;
+    // Find the connection for this peer and grab its RTCPeerConnection.
+    const conns = _libp2p.getConnections(remotePeerId);
+    let pc = null;
+    for (const conn of conns) {
+      pc = getPeerConnection(conn);
+      if (pc) {
+        _pcToPeer.set(pc, remotePeerId);
+        break;
+      }
+    }
+    if (!pc) {
+      if (attempts >= maxAttempts) {
+        clearInterval(timer);
+        console.debug(
+          "addTrackToNewPeer: gave up waiting for WebRTC PC for",
+          remotePeerId.toString(),
+        );
+      }
+      return;
+    }
+    clearInterval(timer);
+
+    // Check we haven't already added our track to this PC.
+    const alreadySending = _senders.some((s) => s.pc === pc);
+    if (alreadySending) return;
+
+    attachPCHandlers(pc);
+    try {
+      const sender = pc.addTrack(track, _localStream);
+      _senders.push({ pc, sender, peerId: remotePeerId });
+      console.log(
+        "Added audio track to newly connected peer",
+        remotePeerId.toString(),
+      );
+      // addTrack will fire negotiationneeded, which triggers the
+      // offer/answer exchange automatically.
+    } catch (err) {
+      console.warn(
+        "Failed to add track to new peer",
+        remotePeerId.toString(),
+        err,
+      );
+    }
+  }, intervalMs);
 }
 
 // Ensure we have a hidden <audio> element for remote playback.
