@@ -143,6 +143,11 @@ pub fn attempt_webrtc_reconnections() -> Nil {
   Nil
 }
 
+@external(javascript, "./libp2p.ffi.mjs", "migrate_audio_tracks")
+pub fn migrate_audio_tracks() -> Nil {
+  Nil
+}
+
 @external(javascript, "./libp2p.ffi.mjs", "get_connection_diagnostics")
 pub fn get_connection_diagnostics() -> List(List(String)) {
   []

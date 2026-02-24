@@ -227,6 +227,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       libp2p.broadcast_audio_presence()
       // Attempt to upgrade any relay-only connections to WebRTC.
       libp2p.attempt_webrtc_reconnections()
+      // Migrate audio tracks to new PCs if connections changed.
+      libp2p.migrate_audio_tracks()
       #(
         Model(
           ..model,

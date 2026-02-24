@@ -495,12 +495,20 @@ function attachPCHandlers(pc) {
 
   // When a remote peer adds a track, play it on a per-peer audio element.
   pc.addEventListener("track", (event) => {
+    console.log(
+      `[WebRTC ${peerLabel()}] Track event: kind=${event.track.kind} state=${event.track.readyState} streams=${event.streams.length}`,
+    );
     const audio = ensureRemoteAudioFor(pc);
     if (event.streams && event.streams.length > 0) {
       audio.srcObject = event.streams[0];
     } else {
       const stream = new MediaStream([event.track]);
       audio.srcObject = stream;
+    }
+    // Ensure playback if user has joined audio.
+    if (_audioJoined) {
+      audio.muted = false;
+      audio.play().catch(() => {});
     }
   });
 
@@ -839,6 +847,52 @@ export function get_peer_audio_states() {
   return toList(results);
 }
 
+// Migrate audio tracks to new PCs when connections are re-established.
+// Called after successful WebRTC reconnection and periodically from Tick.
+// For each peer we're sending audio to, ensure the track is on the current
+// (live) PC, not a stale one.  Also cleans up _senders for dead PCs.
+export function migrate_audio_tracks() {
+  if (!_localStream) return;
+  const track = _localStream.getAudioTracks()[0];
+  if (!track) return;
+
+  // Remove senders for PCs that are no longer live.
+  const staleSenders = _senders.filter((s) => !isPCStillLive(s.pc));
+  for (const stale of staleSenders) {
+    try {
+      stale.pc.removeTrack(stale.sender);
+    } catch (_) {
+      // PC may already be closed
+    }
+    console.log(
+      `[AudioMigrate] Removed stale sender for ${stale.peerId.toString().slice(-8)}`,
+    );
+  }
+  _senders = _senders.filter((s) => isPCStillLive(s.pc));
+
+  // For each WebRTC peer, ensure we have a sender on their current PC.
+  const peers = getWebRTCPeers();
+  for (const { peerId, pc } of peers) {
+    const hasSender = _senders.some((s) => s.pc === pc);
+    if (hasSender) continue;
+
+    attachPCHandlers(pc);
+    try {
+      const sender = pc.addTrack(track, _localStream);
+      _senders.push({ pc, sender, peerId });
+      console.log(
+        `[AudioMigrate] Added audio track to new PC for ${peerId.toString().slice(-8)}`,
+      );
+      // addTrack fires negotiationneeded automatically.
+    } catch (err) {
+      console.warn(
+        `[AudioMigrate] Failed to add track to ${peerId.toString().slice(-8)}:`,
+        err,
+      );
+    }
+  }
+}
+
 // -- WebRTC reconnection --
 //
 // When a WebRTC connection dies and falls back to circuit relay, we try to
@@ -930,6 +984,9 @@ export function attempt_webrtc_reconnections() {
         console.log(
           `[Reconnect] Successfully re-established WebRTC connection to ${pidStr.slice(-8)}`,
         );
+        // Migrate audio tracks to the new WebRTC PC so audio flows
+        // over the direct connection instead of the dead/relay path.
+        migrate_audio_tracks();
       })
       .catch((err) => {
         console.warn(
