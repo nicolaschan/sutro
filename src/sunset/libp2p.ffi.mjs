@@ -631,6 +631,14 @@ function attachPCHandlers(pc) {
       );
       return;
     }
+    // Skip if the PC's transport is dead or not yet fully established.
+    if (pc.connectionState === "closed" || pc.connectionState === "failed") {
+      console.log(
+        `Skipping negotiationneeded — PC connectionState=${pc.connectionState} for`,
+        peerId.toString(),
+      );
+      return;
+    }
     // Skip if we're already mid-negotiation on this PC to avoid glare.
     if (_negotiationBusy.has(pc)) {
       console.log("Skipping negotiationneeded — negotiation already in flight");
@@ -1146,6 +1154,15 @@ export function migrate_audio_tracks() {
       continue;
     }
 
+    // Don't add tracks to PCs that aren't fully connected yet — they may
+    // still be killed by libp2p's duplicate multiaddr abort.
+    if (pc.connectionState !== "connected") {
+      console.debug(
+        `[AudioMigrate] Skipping addTrack for ${peerId.toString().slice(-8)} — connectionState=${pc.connectionState}`,
+      );
+      continue;
+    }
+
     // Don't add tracks if the PC isn't in stable signaling state — it means
     // an offer/answer exchange is already underway.
     if (pc.signalingState !== "stable") {
@@ -1277,9 +1294,14 @@ export function attempt_webrtc_reconnections() {
         console.log(
           `[Reconnect] Successfully re-established WebRTC connection to ${pidStr.slice(-8)}`,
         );
-        // Migrate audio tracks to the new WebRTC PC so audio flows
-        // over the direct connection instead of the dead/relay path.
-        migrate_audio_tracks();
+        // Reset the cooldown from the moment of success (not the attempt
+        // start) so the connection has the full cooldown window to stabilize
+        // before another reconnection can be triggered.
+        _reconnectLastAttempt.set(pidStr, Date.now());
+        // Don't call migrate_audio_tracks() here — the new connection
+        // needs time to survive libp2p's duplicate multiaddr check.
+        // Audio migration is handled by the Tick-based migrate_audio_tracks()
+        // which runs every second and will pick up the new PC naturally.
       })
       .catch((err) => {
         console.warn(
