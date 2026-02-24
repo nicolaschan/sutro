@@ -203,15 +203,21 @@ function getPeerConnection(conn) {
 
 // Get all WebRTC connections with their peer IDs and RTCPeerConnections.
 // Returns array of { peerId, pc, conn }.
+// When a peer has multiple WebRTC connections, returns only the first
+// (oldest/most established) one to avoid duplicate addTrack/negotiation.
 function getWebRTCPeers() {
   if (!_libp2p) return [];
+  const seen = new Set(); // peer ID strings already included
   const results = [];
   for (const conn of _libp2p.getConnections()) {
     // Only WebRTC connections have an RTCPeerConnection
     const pc = getPeerConnection(conn);
     if (pc == null) continue;
     const peerId = conn.remotePeer; // PeerId object, not string
+    const pidStr = peerId.toString();
     _pcToPeer.set(pc, peerId);
+    if (seen.has(pidStr)) continue;
+    seen.add(pidStr);
     results.push({ peerId, pc, conn });
   }
   return results;
@@ -219,6 +225,7 @@ function getWebRTCPeers() {
 
 // Find the RTCPeerConnection for a given PeerId by scanning all connections.
 // Returns null if the peer has no WebRTC connection (e.g. circuit relay only).
+// When a peer has multiple WebRTC connections, returns the first live one.
 function findPCForPeer(peerId) {
   if (!_libp2p) return null;
   const peerIdStr = peerId.toString();
@@ -228,6 +235,20 @@ function findPCForPeer(peerId) {
     if (pc) return pc;
   }
   return null;
+}
+
+// Find ALL RTCPeerConnections for a given PeerId.
+// Returns an array of PCs (may be empty).
+function findAllPCsForPeer(peerId) {
+  if (!_libp2p) return [];
+  const peerIdStr = peerId.toString();
+  const pcs = [];
+  for (const conn of _libp2p.getConnections()) {
+    if (conn.remotePeer.toString() !== peerIdStr) continue;
+    const pc = getPeerConnection(conn);
+    if (pc) pcs.push(pc);
+  }
+  return pcs;
 }
 
 // Check whether a given RTCPeerConnection still backs a live libp2p connection.
@@ -520,75 +541,51 @@ export function register_signaling_handler() {
       attachPCHandlers(pc);
 
       if (message.type === "offer") {
-        // If we're in the middle of our own offer (glare / simultaneous
-        // negotiation), roll back our local description first so we can
-        // accept the remote offer cleanly.
-        if (pc.signalingState === "have-local-offer") {
-          console.log("Rolling back local offer to accept remote offer (glare)");
-          await pc.setLocalDescription({ type: "rollback" });
+        // Try to apply the offer to the primary PC.  If it fails with an
+        // ICE-credential mismatch, the peer may have multiple WebRTC
+        // connections — try each one.  This happens when both sides dial
+        // simultaneously and libp2p creates 2+ PCs per peer.
+        const applied = await tryApplyOffer(pc, remotePeerId, message.sdp);
+        if (!applied) {
+          console.error(
+            "Failed to apply offer on any PC for",
+            remotePeerId.toString(),
+          );
+          return;
         }
-
-        try {
-          await pc.setRemoteDescription({
-            type: "offer",
-            sdp: message.sdp,
-          });
-        } catch (err) {
-          // The remote offer may carry new ICE credentials (ice-ufrag/ice-pwd)
-          // that look like an ICE restart.  Chrome/Firefox reject this with:
-          //   "Remote description indicates ICE restart but offer did not
-          //    request ICE restart"
-          // Fix: create a throwaway local offer with iceRestart:true to advance
-          // our local ICE generation, roll back to stable, then accept the
-          // remote offer — the credential mismatch disappears because our local
-          // ICE state now expects new credentials.
-          if (
-            err instanceof DOMException &&
-            (err.message.includes("ICE restart") ||
-             err.message.includes("ice-ufrag") ||
-             err.message.includes("ice-pwd"))
-          ) {
-            console.warn(
-              "ICE-restart mismatch — advancing local ICE generation and retrying",
-            );
-            try {
-              // 1. Create a local offer with ICE restart to bump our credentials
-              const localOffer = await pc.createOffer({ iceRestart: true });
-              await pc.setLocalDescription(localOffer);
-              // 2. Roll back so we're in "stable" state again
-              await pc.setLocalDescription({ type: "rollback" });
-              // 3. Now accept the remote offer — credentials match
-              await pc.setRemoteDescription({
-                type: "offer",
-                sdp: message.sdp,
-              });
-            } catch (retryErr) {
-              console.error("ICE restart recovery failed:", retryErr);
-              throw retryErr;
-            }
-          } else {
-            throw err;
-          }
-        }
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        await sendSignalingMessage(remotePeerId, {
-          type: "answer",
-          sdp: pc.localDescription.sdp,
-        });
       } else if (message.type === "answer") {
         // Only apply the answer if we're actually expecting one.
+        // Try the primary PC first, then others if it doesn't match.
         if (pc.signalingState === "have-local-offer") {
           await pc.setRemoteDescription({
             type: "answer",
             sdp: message.sdp,
           });
         } else {
-          console.warn(
-            "Ignoring answer in unexpected signaling state:",
-            pc.signalingState,
-          );
+          // The answer may be for a different PC (multi-connection case).
+          const allPCs = findAllPCsForPeer(remotePeerId);
+          let answered = false;
+          for (const otherPC of allPCs) {
+            if (otherPC === pc) continue;
+            if (otherPC.signalingState === "have-local-offer") {
+              try {
+                await otherPC.setRemoteDescription({
+                  type: "answer",
+                  sdp: message.sdp,
+                });
+                answered = true;
+                break;
+              } catch (_) {
+                // Try next PC
+              }
+            }
+          }
+          if (!answered) {
+            console.warn(
+              "Ignoring answer — no PC in have-local-offer state for",
+              remotePeerId.toString(),
+            );
+          }
         }
       } else {
         console.warn("Unknown signaling message type:", message.type);
@@ -597,6 +594,81 @@ export function register_signaling_handler() {
       console.error("Signaling handler error:", err);
     }
   });
+}
+
+// Try to apply a remote SDP offer to a peer connection.  If the primary PC
+// fails due to ICE credential mismatch (multiple connections), try all other
+// PCs for the same peer.  Returns true if successfully applied + answered.
+async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
+  // Build ordered list: primary first, then alternatives.
+  const allPCs = findAllPCsForPeer(remotePeerId);
+  const ordered = [primaryPC, ...allPCs.filter((p) => p !== primaryPC)];
+
+  for (const pc of ordered) {
+    _pcToPeer.set(pc, remotePeerId);
+    attachPCHandlers(pc);
+
+    try {
+      // If we're in the middle of our own offer (glare), roll back first.
+      if (pc.signalingState === "have-local-offer") {
+        console.log(
+          `Rolling back local offer on PC to accept remote offer (glare) [${remotePeerId.toString().slice(-8)}]`,
+        );
+        await pc.setLocalDescription({ type: "rollback" });
+      }
+
+      await pc.setRemoteDescription({ type: "offer", sdp });
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await sendSignalingMessage(remotePeerId, {
+        type: "answer",
+        sdp: pc.localDescription.sdp,
+      });
+      return true;
+    } catch (err) {
+      const isIceRestart =
+        err instanceof DOMException &&
+        (err.message.includes("ICE restart") ||
+         err.message.includes("ice-ufrag") ||
+         err.message.includes("ice-pwd"));
+
+      if (isIceRestart) {
+        // This PC has mismatched ICE credentials — try advancing ICE
+        // generation before giving up on this PC.
+        try {
+          const localOffer = await pc.createOffer({ iceRestart: true });
+          await pc.setLocalDescription(localOffer);
+          await pc.setLocalDescription({ type: "rollback" });
+          await pc.setRemoteDescription({ type: "offer", sdp });
+
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          await sendSignalingMessage(remotePeerId, {
+            type: "answer",
+            sdp: pc.localDescription.sdp,
+          });
+          console.log(
+            `Applied offer after ICE restart recovery [${remotePeerId.toString().slice(-8)}]`,
+          );
+          return true;
+        } catch (retryErr) {
+          console.debug(
+            `ICE restart recovery failed on PC, trying next [${remotePeerId.toString().slice(-8)}]:`,
+            retryErr.message,
+          );
+          // Fall through to try next PC
+        }
+      } else {
+        console.debug(
+          `setRemoteDescription failed on PC, trying next [${remotePeerId.toString().slice(-8)}]:`,
+          err.message,
+        );
+        // Fall through to try next PC
+      }
+    }
+  }
+  return false;
 }
 
 // Start sending microphone audio to all connected WebRTC peers.
