@@ -205,7 +205,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let peer_addrs =
         list.filter_map(raw_addrs, fn(pair) {
           case pair {
-            [pid, addr] -> Ok(#(pid, addr))
+            [pid, addr, transport] -> Ok(#(pid, addr, transport))
             _ -> Error(Nil)
           }
         })

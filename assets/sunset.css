@@ -428,6 +428,11 @@ body {
   background: #818cf8;
 }
 
+.room-peer-dot-circuit {
+  background: #f97316;
+  box-shadow: 0 0 6px rgba(249, 115, 22, 0.4);
+}
+
 .room-peer-info {
   min-width: 0;
   flex: 1;

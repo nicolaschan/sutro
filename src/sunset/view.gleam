@@ -151,6 +151,8 @@ fn view_room(model: Model) -> Element(Msg) {
                 [class("room-peers-list")],
                 list.map(peers, fn(peer_id) {
                   let is_relay = peer_id == model.relay_peer_id
+                  let transport = peer_transport(model, peer_id)
+                  let is_circuit = transport == "Circuit Relay"
                   let addr = peer_addr(model, peer_id)
                   li(
                     [
@@ -166,6 +168,7 @@ fn view_room(model: Model) -> Element(Msg) {
                           classes([
                             #("room-peer-dot", True),
                             #("room-peer-dot-relay", is_relay),
+                            #("room-peer-dot-circuit", is_circuit && !is_relay),
                           ]),
                         ],
                         [],
@@ -173,7 +176,10 @@ fn view_room(model: Model) -> Element(Msg) {
                       div([class("room-peer-info")], [
                         div([class("room-peer-name")], [
                           span([class("room-peer-id")], [
-                            text(short_peer_id(peer_id)),
+                            case is_relay {
+                              True -> text(relay_display_name(addr))
+                              False -> text(short_peer_id(peer_id))
+                            },
                           ]),
                           case is_relay {
                             True ->
@@ -181,10 +187,16 @@ fn view_room(model: Model) -> Element(Msg) {
                             False -> text("")
                           },
                         ]),
-                        case addr {
-                          "" -> text("")
-                          a ->
-                            div([class("room-peer-addr"), title(a)], [text(a)])
+                        case is_relay {
+                          True -> text("")
+                          False ->
+                            case addr {
+                              "" -> text("")
+                              a ->
+                                div([class("room-peer-addr"), title(a)], [
+                                  text(a),
+                                ])
+                            }
                         },
                       ]),
                     ],
@@ -520,9 +532,23 @@ fn short_peer_id(peer_id: String) -> String {
   }
 }
 
+fn relay_display_name(addr: String) -> String {
+  case string.split(addr, "/") {
+    ["", "dns", hostname, ..] -> hostname
+    _ -> "relay"
+  }
+}
+
 fn peer_addr(model: Model, peer_id: String) -> String {
   case list.find(model.peer_addrs, fn(pair) { pair.0 == peer_id }) {
-    Ok(#(_, addr)) -> addr
+    Ok(#(_, addr, _)) -> addr
+    Error(_) -> ""
+  }
+}
+
+fn peer_transport(model: Model, peer_id: String) -> String {
+  case list.find(model.peer_addrs, fn(pair) { pair.0 == peer_id }) {
+    Ok(#(_, _, transport)) -> transport
     Error(_) -> ""
   }
 }

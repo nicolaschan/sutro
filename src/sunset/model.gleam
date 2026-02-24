@@ -30,7 +30,7 @@ pub type Model {
     multiaddr_input: String,
     addresses: List(String),
     peers: List(String),
-    peer_addrs: List(#(String, String)),
+    peer_addrs: List(#(String, String, String)),
     connection_count: Int,
     error: String,
     chat_input: String,

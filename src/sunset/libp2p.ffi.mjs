@@ -29,13 +29,12 @@ export function set_timeout(callback, ms) {
 export function init_libp2p(dispatch) {
   createLibp2p({
     addresses: {
-      // listen: ["/p2p-circuit", "/webrtc"],
-      listen: ["/p2p-circuit"],
+      listen: ["/p2p-circuit", "/webrtc"],
     },
     transports: [
       webSockets(),
       webTransport(),
-      // webRTC(),
+      webRTC(),
       circuitRelayTransport(),
     ],
     connectionEncrypters: [noise()],
@@ -566,19 +565,27 @@ export function get_relay_peer_id() {
 // Returns a Gleam List of [peer_id, remote_addr] pairs (each a Gleam List of strings).
 export function get_peer_remote_addrs() {
   if (!_libp2p) return toList([]);
-  const best = new Map(); // peer_id -> { addr, isCircuit }
+  const best = new Map(); // peer_id -> { addr, transport, isCircuit }
   for (const conn of _libp2p.getConnections()) {
     const pid = conn.remotePeer.toString();
     const addr = conn.remoteAddr.toString();
-    const isCircuit = Circuit.exactMatch(conn.remoteAddr);
+    const ma = conn.remoteAddr;
+    const isCircuit = Circuit.exactMatch(ma);
+    let transport = "Other";
+    if (WebRTC.exactMatch(ma)) transport = "WebRTC";
+    else if (WebRTCDirect.exactMatch(ma)) transport = "WebRTC Direct";
+    else if (WebSocketsSecure.exactMatch(ma)) transport = "WebSockets (secure)";
+    else if (WebSockets.exactMatch(ma)) transport = "WebSockets";
+    else if (WebTransport.exactMatch(ma)) transport = "WebTransport";
+    else if (isCircuit) transport = "Circuit Relay";
     const existing = best.get(pid);
     if (!existing || (existing.isCircuit && !isCircuit)) {
-      best.set(pid, { addr, isCircuit });
+      best.set(pid, { addr, transport, isCircuit });
     }
   }
   const results = [];
-  for (const [pid, { addr }] of best) {
-    results.push(toList([pid, addr]));
+  for (const [pid, { addr, transport }] of best) {
+    results.push(toList([pid, addr, transport]));
   }
   return toList(results);
 }
