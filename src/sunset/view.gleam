@@ -13,10 +13,11 @@ import lustre/event.{on_click, on_input, on_submit}
 import sunset/libp2p
 import sunset/model.{
   type Model, type Msg, Dev, Home, RelayConnected, RelayConnecting,
-  RelayDisconnected, RelayFailed, Room, UserClickedConnect, UserClickedJoinRoom,
-  UserClickedLeaveRoom, UserClickedPeer, UserClickedSend, UserClickedStartAudio,
-  UserClickedStopAudio, UserClosedPeerModal, UserToggledNodeInfo,
-  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedRoomInput,
+  RelayDisconnected, RelayFailed, Room, UserClickedConnect, UserClickedJoinAudio,
+  UserClickedJoinRoom, UserClickedLeaveAudio, UserClickedLeaveRoom,
+  UserClickedPeer, UserClickedSend, UserClickedStartAudio, UserClickedStopAudio,
+  UserClosedPeerModal, UserToggledNodeInfo, UserUpdatedChatInput,
+  UserUpdatedMultiaddr, UserUpdatedRoomInput,
 }
 
 pub fn view(model: Model) -> Element(Msg) {
@@ -208,37 +209,49 @@ fn view_room(model: Model) -> Element(Msg) {
       ]),
       // Voice call controls (pinned bottom)
       div([class("room-voice")], [
-        case model.audio_sending {
-          True ->
-            button(
-              [
-                on_click(UserClickedStopAudio),
-                class("room-voice-button room-voice-active"),
-              ],
-              [text("Leave call")],
-            )
-          False ->
-            button(
-              [
-                on_click(UserClickedStartAudio),
-                class("room-voice-button"),
-              ],
-              [text("Join voice")],
-            )
-        },
-        div([class("room-voice-status")], [
-          case model.audio_sending {
+        div([class("room-voice-row")], [
+          // Join / Leave audio listening
+          case model.audio_joined {
             True ->
-              span([class("room-voice-indicator room-voice-indicator-active")], [
-                text("Mic on"),
-              ])
-            False -> text("")
+              button(
+                [
+                  on_click(UserClickedLeaveAudio),
+                  class("room-voice-btn room-voice-btn-active"),
+                ],
+                [text("Leave audio")],
+              )
+            False ->
+              button(
+                [
+                  on_click(UserClickedJoinAudio),
+                  class("room-voice-btn"),
+                ],
+                [text("Join audio")],
+              )
           },
-          case model.audio_receiving {
+          // Mic on/off icon (only shown when joined)
+          case model.audio_joined {
             True ->
-              span([class("room-voice-indicator room-voice-indicator-active")], [
-                text("Receiving"),
-              ])
+              case model.audio_sending {
+                True ->
+                  button(
+                    [
+                      on_click(UserClickedStopAudio),
+                      class("room-voice-icon-btn room-voice-icon-btn-active"),
+                      title("Turn off mic"),
+                    ],
+                    [text("\u{1F3A4}")],
+                  )
+                False ->
+                  button(
+                    [
+                      on_click(UserClickedStartAudio),
+                      class("room-voice-icon-btn"),
+                      title("Turn on mic"),
+                    ],
+                    [text("\u{1F507}")],
+                  )
+              }
             False -> text("")
           },
         ]),
@@ -472,6 +485,20 @@ fn view_chat(model: Model) -> Element(Msg) {
 
 fn view_audio(model: Model) -> Element(Msg) {
   div([class("audio-controls")], [
+    // Join / Leave audio listening
+    case model.audio_joined {
+      True ->
+        button(
+          [on_click(UserClickedLeaveAudio), class("audio-button audio-stop")],
+          [text("Leave Audio")],
+        )
+      False ->
+        button(
+          [on_click(UserClickedJoinAudio), class("audio-button audio-start")],
+          [text("Join Audio")],
+        )
+    },
+    // Start / Stop mic
     case model.audio_sending {
       True ->
         button(
@@ -485,6 +512,20 @@ fn view_audio(model: Model) -> Element(Msg) {
         )
     },
     div([class("audio-status")], [
+      span(
+        [
+          classes([
+            #("audio-indicator", True),
+            #("audio-indicator-active", model.audio_joined),
+          ]),
+        ],
+        [
+          text(case model.audio_joined {
+            True -> "Listening"
+            False -> "Audio off"
+          }),
+        ],
+      ),
       span(
         [
           classes([

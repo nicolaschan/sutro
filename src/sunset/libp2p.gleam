@@ -71,6 +71,21 @@ pub fn is_receiving_audio() -> Bool {
   False
 }
 
+@external(javascript, "./libp2p.ffi.mjs", "join_audio_listening")
+pub fn join_audio_listening() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "leave_audio_listening")
+pub fn leave_audio_listening() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "is_audio_joined")
+pub fn is_audio_joined() -> Bool {
+  False
+}
+
 @external(javascript, "./libp2p.ffi.mjs", "subscribe_to_room")
 pub fn subscribe_to_room(
   _room: String,

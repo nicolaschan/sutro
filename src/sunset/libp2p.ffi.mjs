@@ -189,6 +189,7 @@ let _remoteAudio = null;
 let _senders = []; // { pc, sender, peerId } references for cleanup
 const _pcToPeer = new Map(); // RTCPeerConnection -> PeerId object
 const _attachedPCs = new Set(); // PCs we've already attached listeners to
+let _audioJoined = false; // Whether user has opted in to hear remote audio
 
 // Get the RTCPeerConnection from a libp2p connection object.
 // Uses internal property path: conn.maConn.peerConnection
@@ -218,6 +219,7 @@ function ensureRemoteAudio() {
   if (_remoteAudio) return _remoteAudio;
   _remoteAudio = document.createElement("audio");
   _remoteAudio.autoplay = true;
+  _remoteAudio.muted = !_audioJoined; // Start muted until user joins audio
   _remoteAudio.id = "remote-audio";
   _remoteAudio.style.display = "none";
   document.body.appendChild(_remoteAudio);
@@ -401,6 +403,34 @@ export function is_receiving_audio() {
   if (!_remoteAudio || !_remoteAudio.srcObject) return false;
   const tracks = _remoteAudio.srcObject.getAudioTracks();
   return tracks.some((t) => t.readyState === "live");
+}
+
+// Join audio listening: unmute the remote audio element so the user
+// can hear incoming streams. The element is created on demand but
+// starts muted until the user explicitly joins.
+export function join_audio_listening() {
+  const audio = ensureRemoteAudio();
+  audio.muted = false;
+  audio.autoplay = true;
+  // If the element already has a srcObject, force playback
+  if (audio.srcObject) {
+    audio.play().catch(() => {});
+  }
+  _audioJoined = true;
+}
+
+// Leave audio listening: mute the remote audio element and pause playback.
+export function leave_audio_listening() {
+  if (_remoteAudio) {
+    _remoteAudio.muted = true;
+    _remoteAudio.pause();
+  }
+  _audioJoined = false;
+}
+
+// Returns true if the user has joined audio listening.
+export function is_audio_joined() {
+  return _audioJoined;
 }
 
 // -- Room-based peer discovery via relay --

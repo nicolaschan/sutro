@@ -484,56 +484,75 @@ body {
 .room-voice {
   padding: 1rem;
   border-top: 1px solid rgba(237, 228, 216, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
 }
 
-.room-voice-button {
-  width: 100%;
-  padding: 0.6rem;
-  font-size: 0.85rem;
+.room-voice-row {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.room-voice-btn {
+  flex: 1;
+  padding: 0.7rem 0.5rem;
+  font-size: 0.9rem;
   font-weight: 500;
   font-family: inherit;
-  color: rgba(237, 228, 216, 0.8);
-  background: rgba(200, 120, 60, 0.15);
-  border: 1px solid rgba(200, 120, 60, 0.25);
-  border-radius: 8px;
+  color: rgba(237, 228, 216, 0.7);
+  background: rgba(237, 228, 216, 0.06);
+  border: 1px solid rgba(237, 228, 216, 0.1);
+  border-radius: 6px;
   cursor: pointer;
   transition: all 0.2s;
 }
 
-.room-voice-button:hover {
+.room-voice-btn:hover {
+  background: rgba(237, 228, 216, 0.12);
+}
+
+.room-voice-btn.room-voice-btn-active {
+  background: rgba(200, 120, 60, 0.15);
+  border-color: rgba(200, 120, 60, 0.25);
+  color: rgba(237, 228, 216, 0.8);
+}
+
+.room-voice-btn.room-voice-btn-active:hover {
   background: rgba(200, 120, 60, 0.25);
 }
 
-.room-voice-button.room-voice-active {
-  background: rgba(239, 68, 68, 0.2);
-  border-color: rgba(239, 68, 68, 0.35);
-  color: #fca5a5;
+/* Icon-only mic toggle button */
+.room-voice-icon-btn {
+  flex-shrink: 0;
+  width: 2.5rem;
+  padding: 0.7rem 0;
+  font-size: 0.9rem;
+  line-height: 1;
+  text-align: center;
+  background: rgba(237, 228, 216, 0.06);
+  border: 1px solid rgba(237, 228, 216, 0.1);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
 }
 
-.room-voice-button.room-voice-active:hover {
-  background: rgba(239, 68, 68, 0.3);
+.room-voice-icon-btn:hover {
+  background: rgba(237, 228, 216, 0.12);
 }
 
-.room-voice-status {
-  display: flex;
-  gap: 0.75rem;
-  margin-top: 0.5rem;
-  min-height: 1.2rem;
+.room-voice-icon-btn.room-voice-icon-btn-active {
+  background: rgba(74, 222, 128, 0.1);
+  border-color: rgba(74, 222, 128, 0.2);
 }
 
-.room-voice-indicator {
-  font-size: 0.75rem;
-  color: rgba(237, 228, 216, 0.35);
-}
-
-.room-voice-indicator.room-voice-indicator-active {
-  color: #4ade80;
+.room-voice-icon-btn.room-voice-icon-btn-active:hover {
+  background: rgba(74, 222, 128, 0.18);
 }
 
 .room-voice-error {
   font-size: 0.75rem;
   color: #fca5a5;
-  margin-top: 0.4rem;
 }
 
 /* -- Main chat area -- */

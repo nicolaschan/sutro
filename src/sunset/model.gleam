@@ -37,6 +37,7 @@ pub type Model {
     messages: List(ChatMessage),
     audio_sending: Bool,
     audio_receiving: Bool,
+    audio_joined: Bool,
     audio_error: String,
     selected_peer: Option(String),
   )
@@ -64,6 +65,8 @@ pub type Msg {
   ChatMessageReceived(sender: String, body: String)
   UserClickedStartAudio
   UserClickedStopAudio
+  UserClickedJoinAudio
+  UserClickedLeaveAudio
   AudioStarted
   AudioFailed(error: String)
   PeerDiscovered(peer_id: String, addrs: List(String))

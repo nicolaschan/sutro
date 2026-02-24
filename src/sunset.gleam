@@ -10,10 +10,10 @@ import sunset/model.{
   Model, PeerDialFailed, PeerDialSucceeded, PeerDiscovered, RelayConnected,
   RelayConnecting, RelayDialFailed, RelayDialSucceeded, RelayDisconnected, Room,
   RouteChanged, SendFailed, SendSucceeded, Tick, UserClickedConnect,
-  UserClickedJoinRoom, UserClickedLeaveRoom, UserClickedPeer, UserClickedSend,
-  UserClickedStartAudio, UserClickedStopAudio, UserClosedPeerModal,
-  UserToggledNodeInfo, UserUpdatedChatInput, UserUpdatedMultiaddr,
-  UserUpdatedRoomInput,
+  UserClickedJoinAudio, UserClickedJoinRoom, UserClickedLeaveAudio,
+  UserClickedLeaveRoom, UserClickedPeer, UserClickedSend, UserClickedStartAudio,
+  UserClickedStopAudio, UserClosedPeerModal, UserToggledNodeInfo,
+  UserUpdatedChatInput, UserUpdatedMultiaddr, UserUpdatedRoomInput,
 }
 import sunset/nav
 import sunset/router
@@ -57,6 +57,7 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       messages: [],
       audio_sending: False,
       audio_receiving: False,
+      audio_joined: False,
       audio_error: "",
       selected_peer: None,
     )
@@ -200,6 +201,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let peers = libp2p.get_connected_peers()
       let sending = libp2p.is_audio_active()
       let receiving = libp2p.is_receiving_audio()
+      let audio_joined = libp2p.is_audio_joined()
       let relay_id = libp2p.get_relay_peer_id()
       let raw_addrs = libp2p.get_peer_remote_addrs()
       let peer_addrs =
@@ -219,6 +221,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           connection_count: peer_count,
           audio_sending: sending,
           audio_receiving: receiving,
+          audio_joined: audio_joined,
           relay_peer_id: relay_id,
         ),
         schedule_tick(),
@@ -263,6 +266,20 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(
         Model(..model, audio_sending: False, audio_error: ""),
         stop_audio_effect(),
+      )
+    }
+
+    UserClickedJoinAudio -> {
+      #(
+        Model(..model, audio_joined: True, audio_error: ""),
+        effect.batch([join_audio_effect(), start_audio_effect()]),
+      )
+    }
+
+    UserClickedLeaveAudio -> {
+      #(
+        Model(..model, audio_joined: False, audio_sending: False),
+        effect.batch([leave_audio_effect(), stop_audio_effect()]),
       )
     }
 
@@ -383,6 +400,14 @@ fn start_audio_effect() -> Effect(Msg) {
 
 fn stop_audio_effect() -> Effect(Msg) {
   effect.from(fn(_dispatch) { libp2p.stop_audio() })
+}
+
+fn join_audio_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) { libp2p.join_audio_listening() })
+}
+
+fn leave_audio_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) { libp2p.leave_audio_listening() })
 }
 
 fn subscribe_to_room_effect(room: String) -> Effect(Msg) {
