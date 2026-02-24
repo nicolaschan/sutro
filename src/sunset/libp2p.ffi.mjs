@@ -189,6 +189,7 @@ let _remoteAudio = null;
 let _senders = []; // { pc, sender, peerId } references for cleanup
 const _pcToPeer = new Map(); // RTCPeerConnection -> PeerId object
 const _attachedPCs = new Set(); // PCs we've already attached listeners to
+const _negotiationBusy = new WeakSet(); // PCs with an in-flight negotiation
 let _audioJoined = false; // Whether user has opted in to hear remote audio
 
 // Get the RTCPeerConnection from a libp2p connection object.
@@ -259,21 +260,42 @@ function attachPCHandlers(pc) {
 
   // When addTrack() or removeTrack() changes the SDP, create and send an offer.
   pc.addEventListener("negotiationneeded", async () => {
-      const peerId = _pcToPeer.get(pc);
+    const peerId = _pcToPeer.get(pc);
     if (!peerId) {
       console.warn("negotiationneeded fired but no peer ID mapped for PC");
       return;
     }
+    // Skip if we're already mid-negotiation on this PC to avoid glare.
+    if (_negotiationBusy.has(pc)) {
+      console.log("Skipping negotiationneeded — negotiation already in flight");
+      return;
+    }
+    _negotiationBusy.add(pc);
     try {
-      const offer = await pc.createOffer();
+      // Request ICE restart if the connection is not in a healthy state,
+      // so the offer's ice-ufrag/ice-pwd change is intentional.
+      const iceState = pc.iceConnectionState;
+      const needsRestart =
+        iceState === "disconnected" ||
+        iceState === "failed" ||
+        iceState === "closed";
+      const offer = await pc.createOffer({
+        iceRestart: needsRestart,
+      });
       await pc.setLocalDescription(offer);
       await sendSignalingMessage(peerId, {
         type: "offer",
         sdp: pc.localDescription.sdp,
       });
-      console.log("Sent renegotiation offer to", peerId.toString());
+      console.log(
+        "Sent renegotiation offer to",
+        peerId.toString(),
+        needsRestart ? "(with ICE restart)" : "",
+      );
     } catch (err) {
       console.error("Failed to send renegotiation offer:", err);
+    } finally {
+      _negotiationBusy.delete(pc);
     }
   });
 
@@ -312,10 +334,43 @@ export function register_signaling_handler() {
       attachPCHandlers(pc);
 
       if (message.type === "offer") {
-        await pc.setRemoteDescription({
-          type: "offer",
-          sdp: message.sdp,
-        });
+        // If we're in the middle of our own offer (glare / simultaneous
+        // negotiation), roll back our local description first so we can
+        // accept the remote offer cleanly.
+        if (pc.signalingState === "have-local-offer") {
+          console.log("Rolling back local offer to accept remote offer (glare)");
+          await pc.setLocalDescription({ type: "rollback" });
+        }
+
+        try {
+          await pc.setRemoteDescription({
+            type: "offer",
+            sdp: message.sdp,
+          });
+        } catch (err) {
+          // The remote offer may carry new ICE credentials that look like an
+          // ICE restart even though the offerer didn't intend one.  Roll back
+          // and retry — setRemoteDescription on a clean "stable" state is more
+          // permissive.
+          if (
+            err instanceof DOMException &&
+            err.message.includes("ICE restart")
+          ) {
+            console.warn(
+              "ICE-restart mismatch — rolling back and retrying",
+            );
+            if (pc.signalingState !== "stable") {
+              await pc.setLocalDescription({ type: "rollback" });
+            }
+            await pc.setRemoteDescription({
+              type: "offer",
+              sdp: message.sdp,
+            });
+          } else {
+            throw err;
+          }
+        }
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         await sendSignalingMessage(remotePeerId, {
@@ -323,10 +378,18 @@ export function register_signaling_handler() {
           sdp: pc.localDescription.sdp,
         });
       } else if (message.type === "answer") {
-        await pc.setRemoteDescription({
-          type: "answer",
-          sdp: message.sdp,
-        });
+        // Only apply the answer if we're actually expecting one.
+        if (pc.signalingState === "have-local-offer") {
+          await pc.setRemoteDescription({
+            type: "answer",
+            sdp: message.sdp,
+          });
+        } else {
+          console.warn(
+            "Ignoring answer in unexpected signaling state:",
+            pc.signalingState,
+          );
+        }
       } else {
         console.warn("Unknown signaling message type:", message.type);
       }
