@@ -381,6 +381,46 @@ function attachPCHandlers(pc) {
   if (_attachedPCs.has(pc)) return;
   _attachedPCs.add(pc);
 
+  const peerLabel = () => {
+    const pid = _pcToPeer.get(pc);
+    return pid ? pid.toString().slice(-8) : "unknown";
+  };
+
+  // --- Detailed WebRTC lifecycle logging ---
+  pc.addEventListener("iceconnectionstatechange", () => {
+    console.log(
+      `[WebRTC ${peerLabel()}] ICE connection state: ${pc.iceConnectionState}`,
+    );
+  });
+
+  pc.addEventListener("icegatheringstatechange", () => {
+    console.log(
+      `[WebRTC ${peerLabel()}] ICE gathering state: ${pc.iceGatheringState}`,
+    );
+  });
+
+  pc.addEventListener("connectionstatechange", () => {
+    console.log(
+      `[WebRTC ${peerLabel()}] Connection state: ${pc.connectionState}`,
+    );
+  });
+
+  pc.addEventListener("signalingstatechange", () => {
+    console.log(
+      `[WebRTC ${peerLabel()}] Signaling state: ${pc.signalingState}`,
+    );
+  });
+
+  pc.addEventListener("icecandidate", (event) => {
+    if (event.candidate) {
+      console.debug(
+        `[WebRTC ${peerLabel()}] ICE candidate: ${event.candidate.type ?? "unknown"} ${event.candidate.protocol ?? ""} ${event.candidate.address ?? ""}:${event.candidate.port ?? ""}`,
+      );
+    } else {
+      console.debug(`[WebRTC ${peerLabel()}] ICE gathering complete`);
+    }
+  });
+
   // When addTrack() or removeTrack() changes the SDP, create and send an offer.
   pc.addEventListener("negotiationneeded", async () => {
     const peerId = _pcToPeer.get(pc);
@@ -709,6 +749,135 @@ export function get_peer_audio_states() {
   const results = [];
   for (const [pid, state] of _peerAudioStates) {
     results.push(toList([pid, state.joined ? "true" : "false", state.muted ? "true" : "false"]));
+  }
+  return toList(results);
+}
+
+// -- WebRTC reconnection --
+//
+// When a WebRTC connection dies and falls back to circuit relay, we try to
+// re-establish the direct WebRTC connection.  The relay-only state is detected
+// by checking whether a peer has any WebRTC connection or only circuit relay.
+// We attempt reconnection at most once every RECONNECT_COOLDOWN_MS per peer.
+
+const RECONNECT_COOLDOWN_MS = 15_000;
+const _reconnectLastAttempt = new Map(); // peer ID string -> timestamp
+const _reconnectInFlight = new Set(); // peer ID strings currently being reconnected
+
+// Check all connected peers and attempt to upgrade any relay-only connections
+// to WebRTC.  Safe to call frequently (called every Tick) — cooldown prevents
+// excessive attempts.
+export function attempt_webrtc_reconnections() {
+  if (!_libp2p) return;
+  const now = Date.now();
+
+  // Group connections by peer
+  const peerConns = new Map(); // peer ID string -> { hasWebRTC, hasRelay, relayAddr }
+  for (const conn of _libp2p.getConnections()) {
+    const pid = conn.remotePeer.toString();
+    const ma = conn.remoteAddr;
+    const entry = peerConns.get(pid) || { hasWebRTC: false, hasRelay: false, relayAddr: null, peerId: conn.remotePeer };
+    if (WebRTC.exactMatch(ma)) {
+      entry.hasWebRTC = true;
+    } else if (Circuit.exactMatch(ma)) {
+      entry.hasRelay = true;
+      entry.relayAddr = ma.toString();
+    }
+    peerConns.set(pid, entry);
+  }
+
+  for (const [pidStr, info] of peerConns) {
+    // Only interested in peers with relay but no WebRTC
+    if (info.hasWebRTC || !info.hasRelay) continue;
+
+    // Skip the relay peer itself
+    const relayPeerId = _getRelayPeerId();
+    if (relayPeerId && pidStr === relayPeerId.toString()) continue;
+
+    // Cooldown check
+    const lastAttempt = _reconnectLastAttempt.get(pidStr) || 0;
+    if (now - lastAttempt < RECONNECT_COOLDOWN_MS) continue;
+
+    // Skip if already in flight
+    if (_reconnectInFlight.has(pidStr)) continue;
+
+    _reconnectLastAttempt.set(pidStr, now);
+    _reconnectInFlight.add(pidStr);
+
+    console.log(
+      `[Reconnect] Peer ${pidStr.slice(-8)} has only circuit relay — attempting WebRTC upgrade`,
+    );
+
+    // Construct a /webrtc address through the relay to this peer.
+    // Format: <relay-multiaddr>/p2p-circuit/webrtc/p2p/<target-peer-id>
+    const relayId = relayPeerId ? relayPeerId.toString() : null;
+    if (!relayId) {
+      console.debug("[Reconnect] No relay peer, cannot construct WebRTC address");
+      _reconnectInFlight.delete(pidStr);
+      continue;
+    }
+
+    // Find the relay's websocket address
+    let relayBaseAddr = null;
+    for (const conn of _libp2p.getConnections()) {
+      if (conn.remotePeer.toString() !== relayId) continue;
+      const ma = conn.remoteAddr;
+      if (WebSockets.exactMatch(ma) || WebSocketsSecure.exactMatch(ma) || WebTransport.exactMatch(ma)) {
+        relayBaseAddr = ma.toString();
+        break;
+      }
+    }
+
+    if (!relayBaseAddr) {
+      console.debug("[Reconnect] Cannot find relay base address");
+      _reconnectInFlight.delete(pidStr);
+      continue;
+    }
+
+    const webrtcAddr = `${relayBaseAddr}/p2p-circuit/webrtc/p2p/${pidStr}`;
+    console.log(`[Reconnect] Dialing ${webrtcAddr}`);
+
+    const ma = multiaddr(webrtcAddr);
+    _libp2p
+      .dial(ma)
+      .then(() => {
+        console.log(
+          `[Reconnect] Successfully re-established WebRTC connection to ${pidStr.slice(-8)}`,
+        );
+      })
+      .catch((err) => {
+        console.warn(
+          `[Reconnect] Failed to re-establish WebRTC to ${pidStr.slice(-8)}: ${err.message}`,
+        );
+      })
+      .finally(() => {
+        _reconnectInFlight.delete(pidStr);
+      });
+  }
+}
+
+// Return diagnostic info about connections for debugging.
+// Returns a Gleam List of [peer_id, transport, state_info] entries.
+export function get_connection_diagnostics() {
+  if (!_libp2p) return toList([]);
+  const results = [];
+  for (const conn of _libp2p.getConnections()) {
+    const pid = conn.remotePeer.toString();
+    const ma = conn.remoteAddr;
+    let transport = "Other";
+    if (WebRTC.exactMatch(ma)) transport = "WebRTC";
+    else if (Circuit.exactMatch(ma)) transport = "Circuit Relay";
+    else if (WebSocketsSecure.exactMatch(ma)) transport = "WebSockets (secure)";
+    else if (WebSockets.exactMatch(ma)) transport = "WebSockets";
+    else if (WebTransport.exactMatch(ma)) transport = "WebTransport";
+
+    const pc = getPeerConnection(conn);
+    let stateInfo = "n/a";
+    if (pc) {
+      stateInfo = `conn=${pc.connectionState} ice=${pc.iceConnectionState} sig=${pc.signalingState}`;
+    }
+
+    results.push(toList([pid, transport, stateInfo]));
   }
   return toList(results);
 }

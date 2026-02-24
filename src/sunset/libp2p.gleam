@@ -137,3 +137,13 @@ pub fn broadcast_audio_presence() -> Nil {
 pub fn get_peer_audio_states() -> List(List(String)) {
   []
 }
+
+@external(javascript, "./libp2p.ffi.mjs", "attempt_webrtc_reconnections")
+pub fn attempt_webrtc_reconnections() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "get_connection_diagnostics")
+pub fn get_connection_diagnostics() -> List(List(String)) {
+  []
+}
