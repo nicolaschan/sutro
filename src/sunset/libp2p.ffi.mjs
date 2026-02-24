@@ -357,9 +357,19 @@ function isPCStillLive(pc) {
 // needs SDP negotiation.  We keep _negotiationBusy held during a cooldown
 // period so the immediate re-fire is suppressed, then trigger a deferred
 // renegotiation once the signaling round-trip has settled.
+//
+// The timer is stored in _postGlareTimers so it can be cancelled/reset if
+// another offer arrives during the cooldown (which resets the window).
+const _postGlareTimers = new WeakMap(); // PC -> timerId
+
 function schedulePostGlareRenegotiation(pc) {
+  // Cancel any existing timer for this PC (reset the cooldown).
+  const existing = _postGlareTimers.get(pc);
+  if (existing) clearTimeout(existing);
+
   // _negotiationBusy is already set by the caller — keep it held.
-  setTimeout(async () => {
+  const timerId = setTimeout(async () => {
+    _postGlareTimers.delete(pc);
     _negotiationBusy.delete(pc);
 
     const peerId = _pcToPeer.get(pc);
@@ -396,6 +406,7 @@ function schedulePostGlareRenegotiation(pc) {
       _negotiationBusy.delete(pc);
     }
   }, POST_GLARE_COOLDOWN_MS);
+  _postGlareTimers.set(pc, timerId);
 }
 
 // When a new peer connects while we're already broadcasting audio, add our
@@ -432,12 +443,35 @@ function addTrackToNewPeer(remotePeerId) {
       }
       return;
     }
-    clearInterval(timer);
 
     // Check we haven't already added our track to this PC.
     const alreadySending = _senders.some((s) => s.pc === pc);
-    if (alreadySending) return;
+    if (alreadySending) {
+      clearInterval(timer);
+      return;
+    }
 
+    // Don't add tracks while negotiation or post-glare cooldown is active.
+    if (_negotiationBusy.has(pc)) {
+      console.debug(
+        "addTrackToNewPeer: skipping — negotiation in flight for",
+        remotePeerId.toString().slice(-8),
+      );
+      // Don't clear interval — retry on next poll.
+      return;
+    }
+
+    // Don't add tracks if the PC isn't in stable signaling state.
+    if (pc.signalingState !== "stable") {
+      console.debug(
+        `addTrackToNewPeer: skipping — signalingState=${pc.signalingState} for`,
+        remotePeerId.toString().slice(-8),
+      );
+      // Don't clear interval — retry on next poll.
+      return;
+    }
+
+    clearInterval(timer);
     attachPCHandlers(pc);
     try {
       const sender = pc.addTrack(track, _localStream);
@@ -798,6 +832,11 @@ async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
       if (wasGlare) {
         _negotiationBusy.add(pc);
         schedulePostGlareRenegotiation(pc);
+      } else if (_negotiationBusy.has(pc)) {
+        // We accepted a new offer while already in a post-glare cooldown.
+        // Reset the cooldown timer so the deferred renegotiation doesn't
+        // fire too soon after this exchange.
+        schedulePostGlareRenegotiation(pc);
       }
 
       return true;
@@ -1049,6 +1088,25 @@ export function migrate_audio_tracks() {
     const hasSender = _senders.some((s) => s.pc === pc);
     if (hasSender) continue;
 
+    // Don't add tracks while a negotiation or post-glare cooldown is active
+    // on this PC — it will fire negotiationneeded which will either be
+    // suppressed (wasting the event) or cause a conflicting offer.
+    if (_negotiationBusy.has(pc)) {
+      console.debug(
+        `[AudioMigrate] Skipping addTrack for ${peerId.toString().slice(-8)} — negotiation in flight`,
+      );
+      continue;
+    }
+
+    // Don't add tracks if the PC isn't in stable signaling state — it means
+    // an offer/answer exchange is already underway.
+    if (pc.signalingState !== "stable") {
+      console.debug(
+        `[AudioMigrate] Skipping addTrack for ${peerId.toString().slice(-8)} — signalingState=${pc.signalingState}`,
+      );
+      continue;
+    }
+
     attachPCHandlers(pc);
     try {
       const sender = pc.addTrack(track, _localStream);
@@ -1072,6 +1130,11 @@ export function migrate_audio_tracks() {
 // re-establish the direct WebRTC connection.  The relay-only state is detected
 // by checking whether a peer has any WebRTC connection or only circuit relay.
 // We attempt reconnection at most once every RECONNECT_COOLDOWN_MS per peer.
+//
+// To avoid both sides dialing simultaneously (which creates duplicate
+// connections that libp2p immediately aborts), we use a deterministic
+// tie-breaker: the peer with the lexicographically higher ID is the primary
+// dialer.  The lower-ID peer waits 2× the cooldown before trying as fallback.
 
 const RECONNECT_COOLDOWN_MS = 15_000;
 const _reconnectLastAttempt = new Map(); // peer ID string -> timestamp
@@ -1107,9 +1170,18 @@ export function attempt_webrtc_reconnections() {
     const relayPeerId = _getRelayPeerId();
     if (relayPeerId && pidStr === relayPeerId.toString()) continue;
 
+    // Deterministic tie-breaker: only the peer with the higher ID dials.
+    // The lower-ID peer uses 2× the cooldown as a fallback in case the
+    // higher-ID peer fails to reconnect.
+    const localId = _libp2p.peerId.toString();
+    const isPrimaryDialer = localId > pidStr;
+    const effectiveCooldown = isPrimaryDialer
+      ? RECONNECT_COOLDOWN_MS
+      : RECONNECT_COOLDOWN_MS * 2;
+
     // Cooldown check
     const lastAttempt = _reconnectLastAttempt.get(pidStr) || 0;
-    if (now - lastAttempt < RECONNECT_COOLDOWN_MS) continue;
+    if (now - lastAttempt < effectiveCooldown) continue;
 
     // Skip if already in flight
     if (_reconnectInFlight.has(pidStr)) continue;
@@ -1118,7 +1190,7 @@ export function attempt_webrtc_reconnections() {
     _reconnectInFlight.add(pidStr);
 
     console.log(
-      `[Reconnect] Peer ${pidStr.slice(-8)} has only circuit relay — attempting WebRTC upgrade`,
+      `[Reconnect] Peer ${pidStr.slice(-8)} has only circuit relay — attempting WebRTC upgrade (${isPrimaryDialer ? "primary" : "fallback"})`,
     );
 
     // Construct a /webrtc address through the relay to this peer.
