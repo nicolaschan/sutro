@@ -19,6 +19,97 @@ import { toList } from "../gleam.mjs";
 
 let _libp2p = null;
 
+// -- Monkey-patch RTCPeerConnection to prevent libp2p from killing
+//    connections on transient ICE disconnections --
+//
+// libp2p's WebRTC transport listens for connectionstatechange and
+// immediately closes the connection when the state is "disconnected".
+// ICE "disconnected" is a transient state that often recovers within
+// seconds (e.g. during SDP renegotiation after addTrack).  We wrap
+// addEventListener so that handlers for connectionstatechange get a
+// delayed notification for "disconnected" — if the connection recovers
+// within the grace period, the handler never sees "disconnected".
+const ICE_DISCONNECT_GRACE_MS = 5000;
+const _originalAddEventListener = RTCPeerConnection.prototype.addEventListener;
+const _disconnectTimers = new WeakMap(); // PC -> Map<listener, timerId>
+
+RTCPeerConnection.prototype.addEventListener = function (type, listener, options) {
+  if (type === "connectionstatechange" || type === "iceconnectionstatechange") {
+    const wrappedListener = (event) => {
+      const state =
+        type === "iceconnectionstatechange"
+          ? this.iceConnectionState
+          : this.connectionState;
+
+      if (state === "disconnected") {
+        // Delay the callback — give ICE time to recover.
+        let timers = _disconnectTimers.get(this);
+        if (!timers) {
+          timers = new Map();
+          _disconnectTimers.set(this, timers);
+        }
+        const timerId = setTimeout(() => {
+          timers.delete(listener);
+          // Only fire if still disconnected (or worse).
+          const currentState =
+            type === "iceconnectionstatechange"
+              ? this.iceConnectionState
+              : this.connectionState;
+          if (
+            currentState === "disconnected" ||
+            currentState === "failed" ||
+            currentState === "closed"
+          ) {
+            listener.call(this, event);
+          }
+        }, ICE_DISCONNECT_GRACE_MS);
+        timers.set(listener, timerId);
+        return;
+      }
+
+      // If the connection recovered (e.g. back to "connected"), cancel
+      // any pending delayed "disconnected" callbacks.
+      if (state === "connected" || state === "completed") {
+        const timers = _disconnectTimers.get(this);
+        if (timers) {
+          for (const [fn, tid] of timers) {
+            clearTimeout(tid);
+          }
+          timers.clear();
+        }
+      }
+
+      listener.call(this, event);
+    };
+    // Store mapping so removeEventListener works (best-effort).
+    if (!this._wrappedListeners) this._wrappedListeners = new Map();
+    this._wrappedListeners.set(listener, wrappedListener);
+    return _originalAddEventListener.call(this, type, wrappedListener, options);
+  }
+  return _originalAddEventListener.call(this, type, listener, options);
+};
+
+const _originalRemoveEventListener =
+  RTCPeerConnection.prototype.removeEventListener;
+RTCPeerConnection.prototype.removeEventListener = function (
+  type,
+  listener,
+  options,
+) {
+  if (
+    (type === "connectionstatechange" ||
+      type === "iceconnectionstatechange") &&
+    this._wrappedListeners
+  ) {
+    const wrapped = this._wrappedListeners.get(listener);
+    if (wrapped) {
+      this._wrappedListeners.delete(listener);
+      return _originalRemoveEventListener.call(this, type, wrapped, options);
+    }
+  }
+  return _originalRemoveEventListener.call(this, type, listener, options);
+};
+
 // setTimeout wrapper for Gleam FFI
 export function set_timeout(callback, ms) {
   setTimeout(callback, ms);
