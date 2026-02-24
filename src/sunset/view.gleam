@@ -157,6 +157,7 @@ fn view_room(model: Model) -> Element(Msg) {
                   let addr = peer_addr(model, peer_id)
                   let #(audio_joined, audio_muted) =
                     peer_audio_state(model, peer_id)
+                  let rtc_state = peer_audio_pc_state(model, peer_id)
                   li(
                     [
                       classes([
@@ -172,6 +173,14 @@ fn view_room(model: Model) -> Element(Msg) {
                             #("room-peer-dot", True),
                             #("room-peer-dot-relay", is_relay),
                             #("room-peer-dot-circuit", is_circuit && !is_relay),
+                            #(
+                              "room-peer-dot-rtc-connected",
+                              rtc_state == "connected",
+                            ),
+                            #(
+                              "room-peer-dot-rtc-connecting",
+                              rtc_state == "new" || rtc_state == "connecting",
+                            ),
                           ]),
                         ],
                         [],
@@ -625,6 +634,15 @@ fn peer_audio_state(model: Model, peer_id: String) -> #(Bool, Bool) {
   case list.find(model.peer_audio_states, fn(entry) { entry.0 == peer_id }) {
     Ok(#(_, joined, muted)) -> #(joined, muted)
     Error(_) -> #(False, False)
+  }
+}
+
+/// Look up a peer's audio PC connection state.
+/// Returns "" if no audio PC, or the connectionState string.
+fn peer_audio_pc_state(model: Model, peer_id: String) -> String {
+  case list.find(model.audio_pc_states, fn(entry) { entry.0 == peer_id }) {
+    Ok(#(_, state)) -> state
+    Error(_) -> ""
   }
 }
 

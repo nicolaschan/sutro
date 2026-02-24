@@ -46,11 +46,6 @@ pub fn broadcast_message(
   Nil
 }
 
-@external(javascript, "./libp2p.ffi.mjs", "register_signaling_handler")
-pub fn register_signaling_handler() -> Nil {
-  Nil
-}
-
 @external(javascript, "./libp2p.ffi.mjs", "start_audio")
 pub fn start_audio(_on_ok: fn() -> Nil, _on_error: fn(String) -> Nil) -> Nil {
   Nil
@@ -58,6 +53,11 @@ pub fn start_audio(_on_ok: fn() -> Nil, _on_error: fn(String) -> Nil) -> Nil {
 
 @external(javascript, "./libp2p.ffi.mjs", "stop_audio")
 pub fn stop_audio() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "close_all_audio_pcs")
+pub fn close_all_audio_pcs() -> Nil {
   Nil
 }
 
@@ -128,6 +128,11 @@ pub fn register_audio_presence_handler() -> Nil {
   Nil
 }
 
+@external(javascript, "./libp2p.ffi.mjs", "register_audio_signaling_handler")
+pub fn register_audio_signaling_handler() -> Nil {
+  Nil
+}
+
 @external(javascript, "./libp2p.ffi.mjs", "broadcast_audio_presence")
 pub fn broadcast_audio_presence() -> Nil {
   Nil
@@ -138,17 +143,7 @@ pub fn get_peer_audio_states() -> List(List(String)) {
   []
 }
 
-@external(javascript, "./libp2p.ffi.mjs", "attempt_webrtc_reconnections")
-pub fn attempt_webrtc_reconnections() -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "migrate_audio_tracks")
-pub fn migrate_audio_tracks() -> Nil {
-  Nil
-}
-
-@external(javascript, "./libp2p.ffi.mjs", "get_connection_diagnostics")
-pub fn get_connection_diagnostics() -> List(List(String)) {
+@external(javascript, "./libp2p.ffi.mjs", "get_audio_pc_states")
+pub fn get_audio_pc_states() -> List(List(String)) {
   []
 }

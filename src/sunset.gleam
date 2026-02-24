@@ -61,6 +61,7 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       audio_error: "",
       selected_peer: None,
       peer_audio_states: [],
+      audio_pc_states: [],
     )
 
   #(
@@ -147,8 +148,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let effects = [
         start_polling(),
         register_chat_effect(),
-        register_signaling_effect(),
         register_audio_presence_effect(),
+        register_audio_signaling_effect(),
       ]
       case new_model.room_name {
         "" -> #(new_model, effect.batch(effects))
@@ -222,13 +223,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             _ -> Error(Nil)
           }
         })
+      let raw_pc_states = libp2p.get_audio_pc_states()
+      let audio_pc_states =
+        list.filter_map(raw_pc_states, fn(entry) {
+          case entry {
+            [pid, state] -> Ok(#(pid, state))
+            _ -> Error(Nil)
+          }
+        })
       let peer_count = list.count(peers, fn(pid) { pid != model.peer_id })
       // Broadcast our audio presence so peers stay in sync.
       libp2p.broadcast_audio_presence()
-      // Attempt to upgrade any relay-only connections to WebRTC.
-      libp2p.attempt_webrtc_reconnections()
-      // Migrate audio tracks to new PCs if connections changed.
-      libp2p.migrate_audio_tracks()
       #(
         Model(
           ..model,
@@ -241,6 +246,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           audio_joined: audio_joined,
           relay_peer_id: relay_id,
           peer_audio_states: peer_audio_states,
+          audio_pc_states: audio_pc_states,
         ),
         schedule_tick(),
       )
@@ -306,7 +312,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Model(..model, audio_joined: False, audio_sending: False),
         effect.batch([
           leave_audio_effect(),
-          stop_audio_effect(),
+          close_all_audio_pcs_effect(),
           broadcast_audio_presence_effect(),
         ]),
       )
@@ -405,16 +411,16 @@ fn register_chat_effect() -> Effect(Msg) {
   })
 }
 
-fn register_signaling_effect() -> Effect(Msg) {
-  effect.from(fn(_dispatch) { libp2p.register_signaling_handler() })
+fn broadcast_audio_presence_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) { libp2p.broadcast_audio_presence() })
 }
 
 fn register_audio_presence_effect() -> Effect(Msg) {
   effect.from(fn(_dispatch) { libp2p.register_audio_presence_handler() })
 }
 
-fn broadcast_audio_presence_effect() -> Effect(Msg) {
-  effect.from(fn(_dispatch) { libp2p.broadcast_audio_presence() })
+fn register_audio_signaling_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) { libp2p.register_audio_signaling_handler() })
 }
 
 fn broadcast_effect(msg_text: String) -> Effect(Msg) {
@@ -437,6 +443,10 @@ fn start_audio_effect() -> Effect(Msg) {
 
 fn stop_audio_effect() -> Effect(Msg) {
   effect.from(fn(_dispatch) { libp2p.stop_audio() })
+}
+
+fn close_all_audio_pcs_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) { libp2p.close_all_audio_pcs() })
 }
 
 fn join_audio_effect() -> Effect(Msg) {

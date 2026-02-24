@@ -434,6 +434,23 @@ body {
   box-shadow: 0 0 6px rgba(249, 115, 22, 0.4);
 }
 
+.room-peer-dot-rtc-connected {
+  box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.35), 0 0 8px rgba(74, 222, 128, 0.25);
+}
+
+.room-peer-dot-rtc-connecting {
+  animation: rtc-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes rtc-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.45), 0 0 8px rgba(251, 191, 36, 0.2);
+  }
+}
+
 .room-peer-info {
   min-width: 0;
   flex: 1;

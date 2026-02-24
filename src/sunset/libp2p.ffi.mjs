@@ -19,97 +19,6 @@ import { toList } from "../gleam.mjs";
 
 let _libp2p = null;
 
-// -- Monkey-patch RTCPeerConnection to prevent libp2p from killing
-//    connections on transient ICE disconnections --
-//
-// libp2p's WebRTC transport listens for connectionstatechange and
-// immediately closes the connection when the state is "disconnected".
-// ICE "disconnected" is a transient state that often recovers within
-// seconds (e.g. during SDP renegotiation after addTrack).  We wrap
-// addEventListener so that handlers for connectionstatechange get a
-// delayed notification for "disconnected" — if the connection recovers
-// within the grace period, the handler never sees "disconnected".
-const ICE_DISCONNECT_GRACE_MS = 5000;
-const _originalAddEventListener = RTCPeerConnection.prototype.addEventListener;
-const _disconnectTimers = new WeakMap(); // PC -> Map<listener, timerId>
-
-RTCPeerConnection.prototype.addEventListener = function (type, listener, options) {
-  if (type === "connectionstatechange" || type === "iceconnectionstatechange") {
-    const wrappedListener = (event) => {
-      const state =
-        type === "iceconnectionstatechange"
-          ? this.iceConnectionState
-          : this.connectionState;
-
-      if (state === "disconnected") {
-        // Delay the callback — give ICE time to recover.
-        let timers = _disconnectTimers.get(this);
-        if (!timers) {
-          timers = new Map();
-          _disconnectTimers.set(this, timers);
-        }
-        const timerId = setTimeout(() => {
-          timers.delete(listener);
-          // Only fire if still disconnected (or worse).
-          const currentState =
-            type === "iceconnectionstatechange"
-              ? this.iceConnectionState
-              : this.connectionState;
-          if (
-            currentState === "disconnected" ||
-            currentState === "failed" ||
-            currentState === "closed"
-          ) {
-            listener.call(this, event);
-          }
-        }, ICE_DISCONNECT_GRACE_MS);
-        timers.set(listener, timerId);
-        return;
-      }
-
-      // If the connection recovered (e.g. back to "connected"), cancel
-      // any pending delayed "disconnected" callbacks.
-      if (state === "connected" || state === "completed") {
-        const timers = _disconnectTimers.get(this);
-        if (timers) {
-          for (const [fn, tid] of timers) {
-            clearTimeout(tid);
-          }
-          timers.clear();
-        }
-      }
-
-      listener.call(this, event);
-    };
-    // Store mapping so removeEventListener works (best-effort).
-    if (!this._wrappedListeners) this._wrappedListeners = new Map();
-    this._wrappedListeners.set(listener, wrappedListener);
-    return _originalAddEventListener.call(this, type, wrappedListener, options);
-  }
-  return _originalAddEventListener.call(this, type, listener, options);
-};
-
-const _originalRemoveEventListener =
-  RTCPeerConnection.prototype.removeEventListener;
-RTCPeerConnection.prototype.removeEventListener = function (
-  type,
-  listener,
-  options,
-) {
-  if (
-    (type === "connectionstatechange" ||
-      type === "iceconnectionstatechange") &&
-    this._wrappedListeners
-  ) {
-    const wrapped = this._wrappedListeners.get(listener);
-    if (wrapped) {
-      this._wrappedListeners.delete(listener);
-      return _originalRemoveEventListener.call(this, type, wrapped, options);
-    }
-  }
-  return _originalRemoveEventListener.call(this, type, listener, options);
-};
-
 // setTimeout wrapper for Gleam FFI
 export function set_timeout(callback, ms) {
   setTimeout(callback, ms);
@@ -142,9 +51,24 @@ export function init_libp2p(dispatch) {
       globalThis.libp2p = libp2p;
 
       libp2p.addEventListener("peer:connect", (event) => {
-        addTrackToNewPeer(event.detail);
+        const remotePeerId = event.detail;
+        const remotePeerIdStr = remotePeerId.toString();
+        console.log("peer:connect", remotePeerIdStr);
+        // If we have audio active, create a PC for the new peer
+        if (_localStream && !_audioPCs.has(remotePeerIdStr)) {
+          const relayPeerId = _getRelayPeerId();
+          if (!relayPeerId || relayPeerId.toString() !== remotePeerIdStr) {
+            const localId = _libp2p.peerId.toString();
+            const shouldOffer = localId > remotePeerIdStr;
+            createAudioPC(remotePeerId, shouldOffer);
+          }
+        }
       });
-      libp2p.addEventListener("peer:disconnect", () => {});
+      libp2p.addEventListener("peer:disconnect", (event) => {
+        const remotePeerIdStr = event.detail.toString();
+        console.log("peer:disconnect", remotePeerIdStr);
+        closeAudioPC(remotePeerIdStr);
+      });
 
       dispatch(libp2p.peerId.toString());
     })
@@ -273,245 +197,292 @@ export function broadcast_message(text, on_ok, on_error) {
     .catch((err) => on_error(err.toString()));
 }
 
-// -- Audio (via SDP renegotiation on libp2p's RTCPeerConnection) --
-
-const SIGNALING_PROTOCOL = "/sunset/signaling/1.0.0";
+// -- Audio --
 
 let _localStream = null;
-const _remoteAudios = new Map(); // RTCPeerConnection -> HTMLAudioElement
-let _senders = []; // { pc, sender, peerId } references for cleanup
-const _pcToPeer = new Map(); // RTCPeerConnection -> PeerId object
-const _attachedPCs = new Set(); // PCs we've already attached listeners to
-const _negotiationBusy = new WeakSet(); // PCs with an in-flight negotiation
-const POST_GLARE_COOLDOWN_MS = 2000; // Cooldown after glare resolution before re-offering
+const _remoteAudios = new Map(); // peer ID string -> HTMLAudioElement
 let _audioJoined = false; // Whether user has opted in to hear remote audio
 
-// Get the RTCPeerConnection from a libp2p connection object.
-// Uses internal property path: conn.maConn.peerConnection
-// (TypeScript `private` compiles to plain JS properties.)
-function getPeerConnection(conn) {
-  return conn.maConn?.peerConnection ?? null;
-}
+// -- Audio signaling + standalone WebRTC connections --
+//
+// Audio uses our own RTCPeerConnection objects, completely separate from
+// libp2p's internal WebRTC transport.  libp2p streams are used only for
+// signaling (SDP offer/answer + ICE candidate exchange).
+//
+// Deterministic offerer: the peer with the lexicographically higher ID
+// always creates the offer.  This prevents glare (simultaneous offers).
 
-// Get all WebRTC connections with their peer IDs and RTCPeerConnections.
-// Returns array of { peerId, pc, conn }.
-// When a peer has multiple WebRTC connections, returns only the first
-// (oldest/most established) one to avoid duplicate addTrack/negotiation.
-function getWebRTCPeers() {
-  if (!_libp2p) return [];
-  const seen = new Set(); // peer ID strings already included
-  const results = [];
-  for (const conn of _libp2p.getConnections()) {
-    // Only WebRTC connections have an RTCPeerConnection
-    const pc = getPeerConnection(conn);
-    if (pc == null) continue;
-    const peerId = conn.remotePeer; // PeerId object, not string
-    const pidStr = peerId.toString();
-    _pcToPeer.set(pc, peerId);
-    if (seen.has(pidStr)) continue;
-    seen.add(pidStr);
-    results.push({ peerId, pc, conn });
+const AUDIO_SIGNALING_PROTOCOL = "/sunset/audio-signaling/1.0.0";
+
+const STUN_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+
+const _audioPCs = new Map(); // peer ID string -> RTCPeerConnection
+
+// Send an audio signaling message to a peer via libp2p stream.
+// Fire-and-forget: one stream per message.
+async function sendAudioSignaling(remotePeerId, message) {
+  const encoded = new TextEncoder().encode(JSON.stringify(message));
+  try {
+    const stream = await _libp2p.dialProtocol(
+      remotePeerId,
+      AUDIO_SIGNALING_PROTOCOL,
+      { runOnLimitedConnection: true },
+    );
+    await stream.send(encoded);
+    await stream.close();
+  } catch (err) {
+    console.warn(
+      `[AudioSignaling] Send failed to ${remotePeerId.toString().slice(-8)}:`,
+      err.message,
+    );
   }
-  return results;
 }
 
-// Find the RTCPeerConnection for a given PeerId by scanning all connections.
-// Returns null if the peer has no WebRTC connection (e.g. circuit relay only).
-// When a peer has multiple WebRTC connections, returns the first live one.
-function findPCForPeer(peerId) {
+// Look up a PeerId object by its string representation.
+function _findPeerId(peerIdStr) {
   if (!_libp2p) return null;
-  const peerIdStr = peerId.toString();
-  for (const conn of _libp2p.getConnections()) {
-    if (conn.remotePeer.toString() !== peerIdStr) continue;
-    const pc = getPeerConnection(conn);
-    if (pc) return pc;
+  for (const pid of _libp2p.getPeers()) {
+    if (pid.toString() === peerIdStr) return pid;
   }
   return null;
 }
 
-// Find ALL RTCPeerConnections for a given PeerId.
-// Returns an array of PCs (may be empty).
-function findAllPCsForPeer(peerId) {
-  if (!_libp2p) return [];
-  const peerIdStr = peerId.toString();
-  const pcs = [];
-  for (const conn of _libp2p.getConnections()) {
-    if (conn.remotePeer.toString() !== peerIdStr) continue;
-    const pc = getPeerConnection(conn);
-    if (pc) pcs.push(pc);
-  }
-  return pcs;
-}
+// Create a standalone RTCPeerConnection for audio with a remote peer.
+// remotePeerId: libp2p PeerId object
+// shouldOffer: if true, creates and sends an SDP offer
+function createAudioPC(remotePeerId, shouldOffer) {
+  const peerIdStr = remotePeerId.toString();
 
-// Check whether a given RTCPeerConnection still backs a live libp2p connection.
-function isPCStillLive(pc) {
-  if (!_libp2p) return false;
-  for (const conn of _libp2p.getConnections()) {
-    if (getPeerConnection(conn) === pc) return true;
-  }
-  return false;
-}
+  // If we already have a PC for this peer, close it first
+  closeAudioPC(peerIdStr);
 
-// After a glare resolution (rollback + accept remote offer + send answer),
-// negotiationneeded fires immediately because the original addTrack still
-// needs SDP negotiation.  We keep _negotiationBusy held during a cooldown
-// period so the immediate re-fire is suppressed, then trigger a deferred
-// renegotiation once the signaling round-trip has settled.
-//
-// The timer is stored in _postGlareTimers so it can be cancelled/reset if
-// another offer arrives during the cooldown (which resets the window).
-const _postGlareTimers = new WeakMap(); // PC -> timerId
+  const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+  _audioPCs.set(peerIdStr, pc);
 
-function schedulePostGlareRenegotiation(pc) {
-  // Cancel any existing timer for this PC (reset the cooldown).
-  const existing = _postGlareTimers.get(pc);
-  if (existing) clearTimeout(existing);
-
-  // _negotiationBusy is already set by the caller — keep it held.
-  const timerId = setTimeout(async () => {
-    _postGlareTimers.delete(pc);
-    _negotiationBusy.delete(pc);
-
-    const peerId = _pcToPeer.get(pc);
-    if (!peerId || !isPCStillLive(pc)) return;
-    if (pc.signalingState !== "stable") return;
-
-    // Only renegotiate if we have local senders on this PC that may need
-    // a new offer (i.e. the addTrack whose negotiation was rolled back).
-    const hasPendingTracks = _senders.some((s) => s.pc === pc);
-    if (!hasPendingTracks) return;
-
-    console.log(
-      `[PostGlare] Cooldown expired, triggering deferred renegotiation for ${peerId.toString().slice(-8)}`,
-    );
-    _negotiationBusy.add(pc);
-    try {
-      const iceState = pc.iceConnectionState;
-      const needsRestart =
-        iceState === "disconnected" ||
-        iceState === "failed" ||
-        iceState === "closed";
-      const offer = await pc.createOffer({ iceRestart: needsRestart });
-      await pc.setLocalDescription(offer);
-      await sendSignalingMessage(peerId, {
-        type: "offer",
-        sdp: pc.localDescription.sdp,
+  // ICE candidate trickling — send each candidate as it's discovered
+  pc.addEventListener("icecandidate", (event) => {
+    if (event.candidate) {
+      sendAudioSignaling(remotePeerId, {
+        type: "candidate",
+        candidate: event.candidate.toJSON(),
       });
-      console.log(
-        `[PostGlare] Sent deferred renegotiation offer to ${peerId.toString().slice(-8)}`,
-      );
-    } catch (err) {
-      console.error("[PostGlare] Deferred renegotiation failed:", err);
-    } finally {
-      _negotiationBusy.delete(pc);
     }
-  }, POST_GLARE_COOLDOWN_MS);
-  _postGlareTimers.set(pc, timerId);
-}
+  });
 
-// When a new peer connects while we're already broadcasting audio, add our
-// audio track to their RTCPeerConnection.  The WebRTC transport upgrade may
-// not be complete when peer:connect fires, so we retry a few times.
-function addTrackToNewPeer(remotePeerId) {
-  if (!_localStream) return; // not broadcasting
-  const track = _localStream.getAudioTracks()[0];
-  if (!track) return;
-
-  let attempts = 0;
-  const maxAttempts = 10;
-  const intervalMs = 500;
-
-  const timer = setInterval(() => {
-    attempts++;
-    // Find the connection for this peer and grab its RTCPeerConnection.
-    const conns = _libp2p.getConnections(remotePeerId);
-    let pc = null;
-    for (const conn of conns) {
-      pc = getPeerConnection(conn);
-      if (pc) {
-        _pcToPeer.set(pc, remotePeerId);
-        break;
-      }
+  // Remote track handler — play received audio
+  pc.addEventListener("track", (event) => {
+    console.log(
+      `[Audio ${peerIdStr.slice(-8)}] Remote track: kind=${event.track.kind}`,
+    );
+    const audio = ensureRemoteAudioFor(peerIdStr);
+    if (event.streams && event.streams.length > 0) {
+      audio.srcObject = event.streams[0];
+    } else {
+      audio.srcObject = new MediaStream([event.track]);
     }
-    if (!pc) {
-      if (attempts >= maxAttempts) {
-        clearInterval(timer);
-        console.debug(
-          "addTrackToNewPeer: gave up waiting for WebRTC PC for",
-          remotePeerId.toString(),
+    if (_audioJoined) {
+      audio.muted = false;
+      audio.play().catch(() => {});
+    }
+  });
+
+  // Connection state logging + cleanup on failure
+  pc.addEventListener("connectionstatechange", () => {
+    console.log(
+      `[Audio ${peerIdStr.slice(-8)}] Connection: ${pc.connectionState}`,
+    );
+    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+      removeRemoteAudioFor(peerIdStr);
+      _audioPCs.delete(peerIdStr);
+    }
+  });
+
+  pc.addEventListener("iceconnectionstatechange", () => {
+    console.log(
+      `[Audio ${peerIdStr.slice(-8)}] ICE: ${pc.iceConnectionState}`,
+    );
+  });
+
+  // Add local audio track if we have one (mic is active)
+  if (_localStream) {
+    const track = _localStream.getAudioTracks()[0];
+    if (track) {
+      pc.addTrack(track, _localStream);
+    }
+  }
+
+  // If we're the offerer, create and send the SDP offer
+  if (shouldOffer) {
+    (async () => {
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await sendAudioSignaling(remotePeerId, {
+          type: "offer",
+          sdp: pc.localDescription.sdp,
+        });
+        console.log(`[Audio ${peerIdStr.slice(-8)}] Sent offer`);
+      } catch (err) {
+        console.error(
+          `[Audio ${peerIdStr.slice(-8)}] Failed to create offer:`,
+          err,
         );
       }
-      return;
-    }
+    })();
+  }
 
-    // Check we haven't already added our track to this PC.
-    const alreadySending = _senders.some((s) => s.pc === pc);
-    if (alreadySending) {
-      clearInterval(timer);
-      return;
-    }
-
-    // Don't add tracks while negotiation or post-glare cooldown is active.
-    if (_negotiationBusy.has(pc)) {
-      console.debug(
-        "addTrackToNewPeer: skipping — negotiation in flight for",
-        remotePeerId.toString().slice(-8),
-      );
-      // Don't clear interval — retry on next poll.
-      return;
-    }
-
-    // Don't add tracks if the PC isn't in stable signaling state.
-    if (pc.signalingState !== "stable") {
-      console.debug(
-        `addTrackToNewPeer: skipping — signalingState=${pc.signalingState} for`,
-        remotePeerId.toString().slice(-8),
-      );
-      // Don't clear interval — retry on next poll.
-      return;
-    }
-
-    clearInterval(timer);
-    attachPCHandlers(pc);
-    try {
-      const sender = pc.addTrack(track, _localStream);
-      _senders.push({ pc, sender, peerId: remotePeerId });
-      console.log(
-        "Added audio track to newly connected peer",
-        remotePeerId.toString(),
-      );
-      // addTrack will fire negotiationneeded, which triggers the
-      // offer/answer exchange automatically.
-    } catch (err) {
-      console.warn(
-        "Failed to add track to new peer",
-        remotePeerId.toString(),
-        err,
-      );
-    }
-  }, intervalMs);
+  return pc;
 }
 
-// Get or create a hidden <audio> element for a specific peer connection.
-function ensureRemoteAudioFor(pc) {
-  if (_remoteAudios.has(pc)) return _remoteAudios.get(pc);
+// Close and remove an audio PC for a peer.
+function closeAudioPC(peerIdStr) {
+  const pc = _audioPCs.get(peerIdStr);
+  if (pc) {
+    pc.close();
+    _audioPCs.delete(peerIdStr);
+    removeRemoteAudioFor(peerIdStr);
+  }
+}
+
+// Register the audio signaling protocol handler.
+// Handles: offer, answer, candidate (ICE trickle), bye (clean hangup).
+export function register_audio_signaling_handler() {
+  if (!_libp2p) return;
+  _libp2p.handle(
+    AUDIO_SIGNALING_PROTOCOL,
+    async (stream, connection) => {
+      try {
+        const text = await readStream(stream);
+        const message = JSON.parse(text);
+        const remotePeerId = connection.remotePeer;
+        const peerIdStr = remotePeerId.toString();
+
+        if (message.type === "offer") {
+          let pc = _audioPCs.get(peerIdStr);
+
+          // Glare: both sides sent offers simultaneously.
+          // The peer with the higher ID wins (keeps their offer).
+          if (pc && pc.signalingState === "have-local-offer") {
+            const localId = _libp2p.peerId.toString();
+            if (localId > peerIdStr) {
+              // We have priority — ignore the remote offer
+              console.log(
+                `[AudioSignaling] Glare: ignoring offer from ${peerIdStr.slice(-8)} (we have priority)`,
+              );
+              return;
+            }
+            // They have priority — close our PC and accept their offer
+            console.log(
+              `[AudioSignaling] Glare: accepting offer from ${peerIdStr.slice(-8)} (they have priority)`,
+            );
+            pc.close();
+            _audioPCs.delete(peerIdStr);
+            pc = null;
+          }
+
+          if (!pc) {
+            pc = createAudioPC(remotePeerId, false);
+          }
+
+          await pc.setRemoteDescription({ type: "offer", sdp: message.sdp });
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          await sendAudioSignaling(remotePeerId, {
+            type: "answer",
+            sdp: pc.localDescription.sdp,
+          });
+          console.log(
+            `[AudioSignaling] Sent answer to ${peerIdStr.slice(-8)}`,
+          );
+        } else if (message.type === "answer") {
+          const pc = _audioPCs.get(peerIdStr);
+          if (!pc) {
+            console.debug(
+              `[AudioSignaling] Answer but no PC for ${peerIdStr.slice(-8)}`,
+            );
+            return;
+          }
+          if (pc.signalingState !== "have-local-offer") {
+            console.debug(
+              `[AudioSignaling] Answer but state=${pc.signalingState} for ${peerIdStr.slice(-8)}`,
+            );
+            return;
+          }
+          await pc.setRemoteDescription({
+            type: "answer",
+            sdp: message.sdp,
+          });
+          console.log(
+            `[AudioSignaling] Applied answer from ${peerIdStr.slice(-8)}`,
+          );
+        } else if (message.type === "candidate") {
+          const pc = _audioPCs.get(peerIdStr);
+          if (!pc) {
+            console.debug(
+              `[AudioSignaling] ICE candidate but no PC for ${peerIdStr.slice(-8)}`,
+            );
+            return;
+          }
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+          } catch (err) {
+            console.debug(
+              `[AudioSignaling] Failed to add ICE candidate:`,
+              err.message,
+            );
+          }
+        } else if (message.type === "bye") {
+          console.log(
+            `[AudioSignaling] Bye from ${peerIdStr.slice(-8)}`,
+          );
+          closeAudioPC(peerIdStr);
+        } else {
+          console.warn(
+            `[AudioSignaling] Unknown message type: ${message.type}`,
+          );
+        }
+      } catch (err) {
+        console.error("[AudioSignaling] Handler error:", err);
+      }
+    },
+    { runOnLimitedConnection: true },
+  );
+}
+
+// Return the audio PC connection states for all peers as a Gleam-friendly
+// List of [peer_id, connection_state].
+// connection_state is one of: "new", "connecting", "connected", "disconnected", "failed", "closed"
+export function get_audio_pc_states() {
+  const results = [];
+  for (const [pid, pc] of _audioPCs) {
+    results.push(toList([pid, pc.connectionState]));
+  }
+  return toList(results);
+}
+
+// Get or create a hidden <audio> element for a remote peer.
+function ensureRemoteAudioFor(peerId) {
+  if (_remoteAudios.has(peerId)) return _remoteAudios.get(peerId);
   const audio = document.createElement("audio");
   audio.autoplay = true;
   audio.muted = !_audioJoined;
   audio.style.display = "none";
   document.body.appendChild(audio);
-  _remoteAudios.set(pc, audio);
+  _remoteAudios.set(peerId, audio);
   return audio;
 }
 
-// Remove the audio element for a peer connection that has closed.
-function removeRemoteAudioFor(pc) {
-  const audio = _remoteAudios.get(pc);
+// Remove the audio element for a peer that has disconnected.
+function removeRemoteAudioFor(peerId) {
+  const audio = _remoteAudios.get(peerId);
   if (audio) {
     audio.pause();
     audio.srcObject = null;
     audio.remove();
-    _remoteAudios.delete(pc);
+    _remoteAudios.delete(peerId);
   }
 }
 
@@ -544,430 +515,34 @@ async function readStream(stream) {
   return new TextDecoder().decode(bytes);
 }
 
-// Send a signaling message to a peer via the libp2p signaling protocol.
-// Retries up to 3 times with exponential back-off (1s, 2s, 4s) when the
-// underlying stream dial times out or fails transiently.
-async function sendSignalingMessage(peerId, message) {
-  const encoded = new TextEncoder().encode(JSON.stringify(message));
-  const maxAttempts = 3;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const stream = await _libp2p.dialProtocol(peerId, SIGNALING_PROTOCOL);
-      stream.send(encoded);
-      await stream.close();
-      return;
-    } catch (err) {
-      if (attempt === maxAttempts) throw err;
-      const delayMs = 1000 * Math.pow(2, attempt - 1);
-      console.debug(
-        `sendSignalingMessage attempt ${attempt} failed, retrying in ${delayMs}ms:`,
-        err.message,
-      );
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-  }
-}
-
-// Attach negotiationneeded + track listeners to a peer connection.
-// Safe to call multiple times — will only attach once per PC.
-function attachPCHandlers(pc) {
-  if (_attachedPCs.has(pc)) return;
-  _attachedPCs.add(pc);
-
-  const peerLabel = () => {
-    const pid = _pcToPeer.get(pc);
-    return pid ? pid.toString().slice(-8) : "unknown";
-  };
-
-  // --- Detailed WebRTC lifecycle logging ---
-  pc.addEventListener("iceconnectionstatechange", () => {
-    console.log(
-      `[WebRTC ${peerLabel()}] ICE connection state: ${pc.iceConnectionState}`,
-    );
-  });
-
-  pc.addEventListener("icegatheringstatechange", () => {
-    console.log(
-      `[WebRTC ${peerLabel()}] ICE gathering state: ${pc.iceGatheringState}`,
-    );
-  });
-
-  pc.addEventListener("connectionstatechange", () => {
-    console.log(
-      `[WebRTC ${peerLabel()}] Connection state: ${pc.connectionState}`,
-    );
-  });
-
-  pc.addEventListener("signalingstatechange", () => {
-    console.log(
-      `[WebRTC ${peerLabel()}] Signaling state: ${pc.signalingState}`,
-    );
-  });
-
-  pc.addEventListener("icecandidate", (event) => {
-    if (event.candidate) {
-      console.debug(
-        `[WebRTC ${peerLabel()}] ICE candidate: ${event.candidate.type ?? "unknown"} ${event.candidate.protocol ?? ""} ${event.candidate.address ?? ""}:${event.candidate.port ?? ""}`,
-      );
-    } else {
-      console.debug(`[WebRTC ${peerLabel()}] ICE gathering complete`);
-    }
-  });
-
-  // When addTrack() or removeTrack() changes the SDP, create and send an offer.
-  pc.addEventListener("negotiationneeded", async () => {
-    const peerId = _pcToPeer.get(pc);
-    if (!peerId) {
-      console.warn("negotiationneeded fired but no peer ID mapped for PC");
-      return;
-    }
-    // If this PC no longer backs a live libp2p connection (e.g. the
-    // connection was downgraded to circuit relay), skip the renegotiation
-    // — the offer would be sent over the relay and discarded.
-    if (!isPCStillLive(pc)) {
-      console.log(
-        "Skipping negotiationneeded — PC is no longer live for",
-        peerId.toString(),
-      );
-      return;
-    }
-    // Skip if we're already mid-negotiation on this PC to avoid glare.
-    if (_negotiationBusy.has(pc)) {
-      console.log("Skipping negotiationneeded — negotiation already in flight");
-      return;
-    }
-    _negotiationBusy.add(pc);
-    try {
-      // Request ICE restart if the connection is not in a healthy state,
-      // so the offer's ice-ufrag/ice-pwd change is intentional.
-      const iceState = pc.iceConnectionState;
-      const needsRestart =
-        iceState === "disconnected" ||
-        iceState === "failed" ||
-        iceState === "closed";
-      const offer = await pc.createOffer({
-        iceRestart: needsRestart,
-      });
-      await pc.setLocalDescription(offer);
-      await sendSignalingMessage(peerId, {
-        type: "offer",
-        sdp: pc.localDescription.sdp,
-      });
-      console.log(
-        "Sent renegotiation offer to",
-        peerId.toString(),
-        needsRestart ? "(with ICE restart)" : "",
-      );
-    } catch (err) {
-      console.error("Failed to send renegotiation offer:", err);
-    } finally {
-      _negotiationBusy.delete(pc);
-    }
-  });
-
-  // When a remote peer adds a track, play it on a per-peer audio element.
-  pc.addEventListener("track", (event) => {
-    console.log(
-      `[WebRTC ${peerLabel()}] Track event: kind=${event.track.kind} state=${event.track.readyState} streams=${event.streams.length}`,
-    );
-    const audio = ensureRemoteAudioFor(pc);
-    if (event.streams && event.streams.length > 0) {
-      audio.srcObject = event.streams[0];
-    } else {
-      const stream = new MediaStream([event.track]);
-      audio.srcObject = stream;
-    }
-    // Ensure playback if user has joined audio.
-    if (_audioJoined) {
-      audio.muted = false;
-      audio.play().catch(() => {});
-    }
-  });
-
-  // Clean up the audio element when the peer connection closes.
-  pc.addEventListener("connectionstatechange", () => {
-    if (pc.connectionState === "closed" || pc.connectionState === "failed") {
-      removeRemoteAudioFor(pc);
-    }
-  });
-}
-
-// Register the signaling protocol handler on the libp2p node.
-// Handles incoming SDP offers and answers from remote peers.
-export function register_signaling_handler() {
-  if (!_libp2p) return;
-  _libp2p.handle(SIGNALING_PROTOCOL, async (stream, connection) => {
-    try {
-      const text = await readStream(stream);
-      const message = JSON.parse(text);
-      const remotePeerId = connection.remotePeer; // PeerId object
-
-      // Find the RTCPeerConnection for this peer.
-      // First try the connection the message arrived on; if that's a relay
-      // connection (no PC), scan all connections for a WebRTC one to the
-      // same peer.
-      let pc = getPeerConnection(connection);
-      if (!pc) {
-        pc = findPCForPeer(remotePeerId);
-      }
-      if (!pc) {
-        console.warn(
-          "Signaling message but no WebRTC connection for peer:",
-          remotePeerId.toString(),
-        );
-        return;
-      }
-      _pcToPeer.set(pc, remotePeerId);
-      attachPCHandlers(pc);
-
-      if (message.type === "offer") {
-        // Try to apply the offer to the primary PC.  If it fails with an
-        // ICE-credential mismatch, the peer may have multiple WebRTC
-        // connections — try each one.  This happens when both sides dial
-        // simultaneously and libp2p creates 2+ PCs per peer.
-        const applied = await tryApplyOffer(pc, remotePeerId, message.sdp);
-        if (!applied) {
-          console.error(
-            "Failed to apply offer on any PC for",
-            remotePeerId.toString(),
-          );
-          return;
-        }
-      } else if (message.type === "answer") {
-        // Only apply the answer if we're actually expecting one.
-        // Try the primary PC first, then others if it doesn't match.
-        // Wrap in try/catch: after glare resolution the answer may be
-        // for a rolled-back offer whose SDP no longer matches.
-        let answered = false;
-
-        if (pc.signalingState === "have-local-offer" &&
-            pc.connectionState !== "closed" && pc.connectionState !== "failed") {
-          try {
-            await pc.setRemoteDescription({
-              type: "answer",
-              sdp: message.sdp,
-            });
-            answered = true;
-          } catch (err) {
-            console.warn(
-              `Failed to apply answer on primary PC for ${remotePeerId.toString().slice(-8)} (SDP mismatch?):`,
-              err.message,
-            );
-            // The PC is now stuck in have-local-offer with no valid answer
-            // coming.  Roll back to stable so it can accept new offers or
-            // create fresh ones via negotiationneeded.
-            try {
-              await pc.setLocalDescription({ type: "rollback" });
-              console.log(
-                `Rolled back stuck have-local-offer on primary PC [${remotePeerId.toString().slice(-8)}]`,
-              );
-              schedulePostGlareRenegotiation(pc);
-            } catch (rollbackErr) {
-              console.warn(
-                `Rollback after answer failure also failed [${remotePeerId.toString().slice(-8)}]:`,
-                rollbackErr.message,
-              );
-            }
-          }
-        }
-
-        if (!answered) {
-          // The answer may be for a different PC (multi-connection case).
-          const allPCs = findAllPCsForPeer(remotePeerId);
-          for (const otherPC of allPCs) {
-            if (otherPC === pc) continue;
-            if (otherPC.connectionState === "closed" || otherPC.connectionState === "failed") continue;
-            if (otherPC.signalingState === "have-local-offer") {
-              try {
-                await otherPC.setRemoteDescription({
-                  type: "answer",
-                  sdp: message.sdp,
-                });
-                answered = true;
-                break;
-              } catch (answerErr) {
-                // Answer didn't match this PC either — roll back so it
-                // doesn't stay stuck in have-local-offer.
-                try {
-                  await otherPC.setLocalDescription({ type: "rollback" });
-                  console.log(
-                    `Rolled back stuck have-local-offer on alt PC [${remotePeerId.toString().slice(-8)}]`,
-                  );
-                  schedulePostGlareRenegotiation(otherPC);
-                } catch (_) {
-                  // Best effort
-                }
-              }
-            }
-          }
-        }
-
-        if (!answered) {
-          // This is expected after glare resolution — the answer is for
-          // the offer that was rolled back, and can be safely ignored.
-          console.debug(
-            "Ignoring stale answer — no PC in have-local-offer state for",
-            remotePeerId.toString(),
-            "(likely already handled by glare resolution)",
-          );
-        }
-      } else {
-        console.warn("Unknown signaling message type:", message.type);
-      }
-    } catch (err) {
-      console.error("Signaling handler error:", err);
-    }
-  });
-}
-
-// Try to apply a remote SDP offer to a peer connection.  If the primary PC
-// fails due to ICE credential mismatch (multiple connections), try all other
-// PCs for the same peer.  Returns true if successfully applied + answered.
-async function tryApplyOffer(primaryPC, remotePeerId, sdp) {
-  // Build ordered list: primary first, then alternatives.
-  const allPCs = findAllPCsForPeer(remotePeerId);
-  const ordered = [primaryPC, ...allPCs.filter((p) => p !== primaryPC)];
-
-  for (const pc of ordered) {
-    // Skip PCs whose underlying transport is already dead.  This prevents
-    // wasted SDP negotiation on connections killed by libp2p's duplicate
-    // multiaddr abort (connected -> closed with no disconnected phase).
-    if (pc.connectionState === "closed" || pc.connectionState === "failed") {
-      console.debug(
-        `Skipping dead PC (${pc.connectionState}) in tryApplyOffer [${remotePeerId.toString().slice(-8)}]`,
-      );
-      continue;
-    }
-
-    _pcToPeer.set(pc, remotePeerId);
-    attachPCHandlers(pc);
-
-    try {
-      // If we're in the middle of our own offer (glare), roll back first.
-      let wasGlare = false;
-      if (pc.signalingState === "have-local-offer") {
-        console.log(
-          `Rolling back local offer on PC to accept remote offer (glare) [${remotePeerId.toString().slice(-8)}]`,
-        );
-        await pc.setLocalDescription({ type: "rollback" });
-        wasGlare = true;
-      }
-
-      await pc.setRemoteDescription({ type: "offer", sdp });
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      // IMPORTANT: Set _negotiationBusy BEFORE sendSignalingMessage.
-      // setLocalDescription(answer) can synchronously fire negotiationneeded
-      // (e.g. if addTrack still needs SDP negotiation after glare rollback).
-      // If we wait until after sendSignalingMessage, the negotiationneeded
-      // handler can run during the await and bypass the cooldown.
-      if (wasGlare) {
-        _negotiationBusy.add(pc);
-      }
-
-      await sendSignalingMessage(remotePeerId, {
-        type: "answer",
-        sdp: pc.localDescription.sdp,
-      });
-
-      // After glare resolution, schedule a deferred renegotiation so the
-      // rolled-back addTrack gets a fresh offer after the cooldown.
-      if (wasGlare) {
-        schedulePostGlareRenegotiation(pc);
-      } else if (_negotiationBusy.has(pc)) {
-        // We accepted a new offer while already in a post-glare cooldown.
-        // Reset the cooldown timer so the deferred renegotiation doesn't
-        // fire too soon after this exchange.
-        schedulePostGlareRenegotiation(pc);
-      }
-
-      return true;
-    } catch (err) {
-      const isIceRestart =
-        err instanceof DOMException &&
-        (err.message.includes("ICE restart") ||
-         err.message.includes("ice-ufrag") ||
-         err.message.includes("ice-pwd"));
-
-      if (isIceRestart) {
-        // This PC has mismatched ICE credentials — try advancing ICE
-        // generation before giving up on this PC.
-        try {
-          const localOffer = await pc.createOffer({ iceRestart: true });
-          await pc.setLocalDescription(localOffer);
-          await pc.setLocalDescription({ type: "rollback" });
-          await pc.setRemoteDescription({ type: "offer", sdp });
-
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-
-          // Set _negotiationBusy BEFORE sendSignalingMessage (same race fix
-          // as the normal glare path above).
-          _negotiationBusy.add(pc);
-
-          await sendSignalingMessage(remotePeerId, {
-            type: "answer",
-            sdp: pc.localDescription.sdp,
-          });
-          console.log(
-            `Applied offer after ICE restart recovery [${remotePeerId.toString().slice(-8)}]`,
-          );
-
-          // ICE restart recovery also involves a rollback — schedule
-          // cooldown for pending local tracks.
-          schedulePostGlareRenegotiation(pc);
-
-          return true;
-        } catch (retryErr) {
-          console.debug(
-            `ICE restart recovery failed on PC, trying next [${remotePeerId.toString().slice(-8)}]:`,
-            retryErr.message,
-          );
-          // Fall through to try next PC
-        }
-      } else {
-        console.debug(
-          `setRemoteDescription failed on PC, trying next [${remotePeerId.toString().slice(-8)}]:`,
-          err.message,
-        );
-        // Fall through to try next PC
-      }
-    }
-  }
-  return false;
-}
-
-// Start sending microphone audio to all connected WebRTC peers.
+// Start capturing microphone audio and create WebRTC peer connections
+// for all currently connected peers.
+// If already acquired (unmuting), just re-enable existing tracks.
 // Calls on_ok() on success, on_error(msg) on failure.
 export function start_audio(on_ok, on_error) {
+  // Unmute: stream exists, just re-enable tracks
   if (_localStream) {
-    on_error("Audio already active");
-    return;
-  }
-  const peers = getWebRTCPeers();
-  if (peers.length === 0) {
-    on_error("No WebRTC peers connected");
+    for (const track of _localStream.getAudioTracks()) {
+      track.enabled = true;
+    }
+    on_ok();
     return;
   }
   navigator.mediaDevices
     .getUserMedia({ audio: true, video: false })
     .then((stream) => {
       _localStream = stream;
-      _senders = [];
-      const track = stream.getAudioTracks()[0];
-      for (const { peerId, pc } of peers) {
-        attachPCHandlers(pc);
-        try {
-          const sender = pc.addTrack(track, stream);
-          _senders.push({ pc, sender, peerId });
-        } catch (err) {
-          console.warn(`Failed to add track to ${peerId.toString()}:`, err);
-        }
+      // Create audio PCs for all connected peers
+      const relayPeerId = _getRelayPeerId();
+      const relayStr = relayPeerId ? relayPeerId.toString() : null;
+      const localId = _libp2p.peerId.toString();
+      for (const peerId of _libp2p.getPeers()) {
+        const pidStr = peerId.toString();
+        if (pidStr === relayStr) continue;
+        if (_audioPCs.has(pidStr)) continue;
+        const shouldOffer = localId > pidStr;
+        createAudioPC(peerId, shouldOffer);
       }
-      // negotiationneeded will fire asynchronously, triggering the
-      // offer/answer exchange via the signaling protocol.
       on_ok();
     })
     .catch((err) => {
@@ -975,30 +550,42 @@ export function start_audio(on_ok, on_error) {
     });
 }
 
-// Stop sending audio and clean up.
+// Mute mic: disable local audio tracks but keep PCs alive for receiving.
 export function stop_audio() {
   if (_localStream) {
-    for (const { pc, sender } of _senders) {
-      try {
-        pc.removeTrack(sender);
-      } catch (_) {
-        // peer connection may already be closed
-      }
+    for (const track of _localStream.getAudioTracks()) {
+      track.enabled = false;
     }
-    _senders = [];
-    // Stop all local tracks (releases microphone)
+  }
+}
+
+// Full teardown: send bye to all audio peers, close all PCs, release mic.
+// Called when leaving audio entirely (not just muting).
+export function close_all_audio_pcs() {
+  // Send bye to all audio peers and close PCs
+  for (const [peerIdStr, pc] of _audioPCs) {
+    const peerId = _findPeerId(peerIdStr);
+    if (peerId) {
+      sendAudioSignaling(peerId, { type: "bye" });
+    }
+    pc.close();
+    removeRemoteAudioFor(peerIdStr);
+  }
+  _audioPCs.clear();
+  // Release the microphone
+  if (_localStream) {
     for (const track of _localStream.getTracks()) {
       track.stop();
     }
     _localStream = null;
-    // removeTrack triggers negotiationneeded, which will renegotiate
-    // to remove the audio from the SDP automatically.
   }
 }
 
-// Returns true if we are currently sending audio.
+// Returns true if we are currently sending audio (mic enabled).
 export function is_audio_active() {
-  return _localStream != null;
+  if (!_localStream) return false;
+  const tracks = _localStream.getAudioTracks();
+  return tracks.length > 0 && tracks[0].enabled;
 }
 
 // Returns true if we are receiving remote audio from any peer.
@@ -1043,7 +630,7 @@ export function is_audio_joined() {
 // Lightweight protocol to tell peers whether we've joined audio and
 // whether our mic is muted.  Each message is a small JSON object:
 //   { "joined": bool, "muted": bool }
-// We send our state to every WebRTC peer whenever it changes and
+// We send our state to every connected peer whenever it changes and
 // periodically (called from the Gleam Tick) so that newly connected
 // peers learn our state quickly.
 
@@ -1065,10 +652,10 @@ export function register_audio_presence_handler() {
     } catch (err) {
       console.debug("Audio presence handler error:", err.message);
     }
-  });
+  }, { runOnLimitedConnection: true });
 }
 
-// Broadcast our current audio state to all WebRTC peers.
+// Broadcast our current audio state to all connected peers.
 // Called on every Tick and whenever local audio state changes.
 export function broadcast_audio_presence() {
   if (!_libp2p) return;
@@ -1077,9 +664,12 @@ export function broadcast_audio_presence() {
     muted: _audioJoined && !_localStream,
   };
   const encoded = new TextEncoder().encode(JSON.stringify(message));
-  for (const { peerId } of getWebRTCPeers()) {
+  const relayPeerId = _getRelayPeerId();
+  const relayStr = relayPeerId ? relayPeerId.toString() : null;
+  for (const peerId of _libp2p.getPeers()) {
+    if (peerId.toString() === relayStr) continue;
     _libp2p
-      .dialProtocol(peerId, AUDIO_PRESENCE_PROTOCOL)
+      .dialProtocol(peerId, AUDIO_PRESENCE_PROTOCOL, { runOnLimitedConnection: true })
       .then((stream) => {
         stream.send(encoded);
         return stream.close();
@@ -1103,217 +693,6 @@ export function get_peer_audio_states() {
   const results = [];
   for (const [pid, state] of _peerAudioStates) {
     results.push(toList([pid, state.joined ? "true" : "false", state.muted ? "true" : "false"]));
-  }
-  return toList(results);
-}
-
-// Migrate audio tracks to new PCs when connections are re-established.
-// Called after successful WebRTC reconnection and periodically from Tick.
-// For each peer we're sending audio to, ensure the track is on the current
-// (live) PC, not a stale one.  Also cleans up _senders for dead PCs.
-export function migrate_audio_tracks() {
-  if (!_localStream) return;
-  const track = _localStream.getAudioTracks()[0];
-  if (!track) return;
-
-  // Remove senders for PCs that are no longer live.
-  const staleSenders = _senders.filter((s) => !isPCStillLive(s.pc));
-  for (const stale of staleSenders) {
-    try {
-      stale.pc.removeTrack(stale.sender);
-    } catch (_) {
-      // PC may already be closed
-    }
-    console.log(
-      `[AudioMigrate] Removed stale sender for ${stale.peerId.toString().slice(-8)}`,
-    );
-  }
-  _senders = _senders.filter((s) => isPCStillLive(s.pc));
-
-  // For each WebRTC peer, ensure we have a sender on their current PC.
-  const peers = getWebRTCPeers();
-  for (const { peerId, pc } of peers) {
-    const hasSender = _senders.some((s) => s.pc === pc);
-    if (hasSender) continue;
-
-    // Don't add tracks while a negotiation or post-glare cooldown is active
-    // on this PC — it will fire negotiationneeded which will either be
-    // suppressed (wasting the event) or cause a conflicting offer.
-    if (_negotiationBusy.has(pc)) {
-      console.debug(
-        `[AudioMigrate] Skipping addTrack for ${peerId.toString().slice(-8)} — negotiation in flight`,
-      );
-      continue;
-    }
-
-    // Don't add tracks if the PC isn't in stable signaling state — it means
-    // an offer/answer exchange is already underway.
-    if (pc.signalingState !== "stable") {
-      console.debug(
-        `[AudioMigrate] Skipping addTrack for ${peerId.toString().slice(-8)} — signalingState=${pc.signalingState}`,
-      );
-      continue;
-    }
-
-    attachPCHandlers(pc);
-    try {
-      const sender = pc.addTrack(track, _localStream);
-      _senders.push({ pc, sender, peerId });
-      console.log(
-        `[AudioMigrate] Added audio track to new PC for ${peerId.toString().slice(-8)}`,
-      );
-      // addTrack fires negotiationneeded automatically.
-    } catch (err) {
-      console.warn(
-        `[AudioMigrate] Failed to add track to ${peerId.toString().slice(-8)}:`,
-        err,
-      );
-    }
-  }
-}
-
-// -- WebRTC reconnection --
-//
-// When a WebRTC connection dies and falls back to circuit relay, we try to
-// re-establish the direct WebRTC connection.  The relay-only state is detected
-// by checking whether a peer has any WebRTC connection or only circuit relay.
-// We attempt reconnection at most once every RECONNECT_COOLDOWN_MS per peer.
-//
-// To avoid both sides dialing simultaneously (which creates duplicate
-// connections that libp2p immediately aborts), we use a deterministic
-// tie-breaker: the peer with the lexicographically higher ID is the primary
-// dialer.  The lower-ID peer waits 2× the cooldown before trying as fallback.
-
-const RECONNECT_COOLDOWN_MS = 15_000;
-const _reconnectLastAttempt = new Map(); // peer ID string -> timestamp
-const _reconnectInFlight = new Set(); // peer ID strings currently being reconnected
-
-// Check all connected peers and attempt to upgrade any relay-only connections
-// to WebRTC.  Safe to call frequently (called every Tick) — cooldown prevents
-// excessive attempts.
-export function attempt_webrtc_reconnections() {
-  if (!_libp2p) return;
-  const now = Date.now();
-
-  // Group connections by peer
-  const peerConns = new Map(); // peer ID string -> { hasWebRTC, hasRelay, relayAddr }
-  for (const conn of _libp2p.getConnections()) {
-    const pid = conn.remotePeer.toString();
-    const ma = conn.remoteAddr;
-    const entry = peerConns.get(pid) || { hasWebRTC: false, hasRelay: false, relayAddr: null, peerId: conn.remotePeer };
-    if (WebRTC.exactMatch(ma)) {
-      entry.hasWebRTC = true;
-    } else if (Circuit.exactMatch(ma)) {
-      entry.hasRelay = true;
-      entry.relayAddr = ma.toString();
-    }
-    peerConns.set(pid, entry);
-  }
-
-  for (const [pidStr, info] of peerConns) {
-    // Only interested in peers with relay but no WebRTC
-    if (info.hasWebRTC || !info.hasRelay) continue;
-
-    // Skip the relay peer itself
-    const relayPeerId = _getRelayPeerId();
-    if (relayPeerId && pidStr === relayPeerId.toString()) continue;
-
-    // Deterministic tie-breaker: only the peer with the higher ID dials.
-    // The lower-ID peer uses 2× the cooldown as a fallback in case the
-    // higher-ID peer fails to reconnect.
-    const localId = _libp2p.peerId.toString();
-    const isPrimaryDialer = localId > pidStr;
-    const effectiveCooldown = isPrimaryDialer
-      ? RECONNECT_COOLDOWN_MS
-      : RECONNECT_COOLDOWN_MS * 2;
-
-    // Cooldown check
-    const lastAttempt = _reconnectLastAttempt.get(pidStr) || 0;
-    if (now - lastAttempt < effectiveCooldown) continue;
-
-    // Skip if already in flight
-    if (_reconnectInFlight.has(pidStr)) continue;
-
-    _reconnectLastAttempt.set(pidStr, now);
-    _reconnectInFlight.add(pidStr);
-
-    console.log(
-      `[Reconnect] Peer ${pidStr.slice(-8)} has only circuit relay — attempting WebRTC upgrade (${isPrimaryDialer ? "primary" : "fallback"})`,
-    );
-
-    // Construct a /webrtc address through the relay to this peer.
-    // Format: <relay-multiaddr>/p2p-circuit/webrtc/p2p/<target-peer-id>
-    const relayId = relayPeerId ? relayPeerId.toString() : null;
-    if (!relayId) {
-      console.debug("[Reconnect] No relay peer, cannot construct WebRTC address");
-      _reconnectInFlight.delete(pidStr);
-      continue;
-    }
-
-    // Find the relay's websocket address
-    let relayBaseAddr = null;
-    for (const conn of _libp2p.getConnections()) {
-      if (conn.remotePeer.toString() !== relayId) continue;
-      const ma = conn.remoteAddr;
-      if (WebSockets.exactMatch(ma) || WebSocketsSecure.exactMatch(ma) || WebTransport.exactMatch(ma)) {
-        relayBaseAddr = ma.toString();
-        break;
-      }
-    }
-
-    if (!relayBaseAddr) {
-      console.debug("[Reconnect] Cannot find relay base address");
-      _reconnectInFlight.delete(pidStr);
-      continue;
-    }
-
-    const webrtcAddr = `${relayBaseAddr}/p2p-circuit/webrtc/p2p/${pidStr}`;
-    console.log(`[Reconnect] Dialing ${webrtcAddr}`);
-
-    const ma = multiaddr(webrtcAddr);
-    _libp2p
-      .dial(ma)
-      .then(() => {
-        console.log(
-          `[Reconnect] Successfully re-established WebRTC connection to ${pidStr.slice(-8)}`,
-        );
-        // Migrate audio tracks to the new WebRTC PC so audio flows
-        // over the direct connection instead of the dead/relay path.
-        migrate_audio_tracks();
-      })
-      .catch((err) => {
-        console.warn(
-          `[Reconnect] Failed to re-establish WebRTC to ${pidStr.slice(-8)}: ${err.message}`,
-        );
-      })
-      .finally(() => {
-        _reconnectInFlight.delete(pidStr);
-      });
-  }
-}
-
-// Return diagnostic info about connections for debugging.
-// Returns a Gleam List of [peer_id, transport, state_info] entries.
-export function get_connection_diagnostics() {
-  if (!_libp2p) return toList([]);
-  const results = [];
-  for (const conn of _libp2p.getConnections()) {
-    const pid = conn.remotePeer.toString();
-    const ma = conn.remoteAddr;
-    let transport = "Other";
-    if (WebRTC.exactMatch(ma)) transport = "WebRTC";
-    else if (Circuit.exactMatch(ma)) transport = "Circuit Relay";
-    else if (WebSocketsSecure.exactMatch(ma)) transport = "WebSockets (secure)";
-    else if (WebSockets.exactMatch(ma)) transport = "WebSockets";
-    else if (WebTransport.exactMatch(ma)) transport = "WebTransport";
-
-    const pc = getPeerConnection(conn);
-    let stateInfo = "n/a";
-    if (pc) {
-      stateInfo = `conn=${pc.connectionState} ice=${pc.iceConnectionState} sig=${pc.signalingState}`;
-    }
-
-    results.push(toList([pid, transport, stateInfo]));
   }
   return toList(results);
 }
@@ -1477,7 +856,7 @@ export function get_relay_peer_id() {
 
 // Get the remote multiaddr for each connected peer.
 // When a peer has multiple connections, prefers the direct (non-circuit) one.
-// Returns a Gleam List of [peer_id, remote_addr] pairs (each a Gleam List of strings).
+// Returns a Gleam List of [peer_id, remote_addr, transport] entries.
 export function get_peer_remote_addrs() {
   if (!_libp2p) return toList([]);
   const best = new Map(); // peer_id -> { addr, transport, isCircuit }
