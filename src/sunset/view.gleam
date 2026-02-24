@@ -155,6 +155,8 @@ fn view_room(model: Model) -> Element(Msg) {
                   let transport = peer_transport(model, peer_id)
                   let is_circuit = transport == "Circuit Relay"
                   let addr = peer_addr(model, peer_id)
+                  let #(audio_joined, audio_muted) =
+                    peer_audio_state(model, peer_id)
                   li(
                     [
                       classes([
@@ -186,6 +188,30 @@ fn view_room(model: Model) -> Element(Msg) {
                             True ->
                               span([class("room-peer-badge")], [text("relay")])
                             False -> text("")
+                          },
+                          // Audio presence indicator
+                          case is_relay, audio_joined {
+                            True, _ -> text("")
+                            _, False -> text("")
+                            _, True ->
+                              span(
+                                [
+                                  classes([
+                                    #("room-peer-audio", True),
+                                    #("room-peer-audio-muted", audio_muted),
+                                  ]),
+                                  title(case audio_muted {
+                                    True -> "In audio (muted)"
+                                    False -> "In audio"
+                                  }),
+                                ],
+                                [
+                                  text(case audio_muted {
+                                    True -> "\u{1F507}"
+                                    False -> "\u{1F3A4}"
+                                  }),
+                                ],
+                              )
                           },
                         ]),
                         case is_relay {
@@ -591,6 +617,14 @@ fn peer_transport(model: Model, peer_id: String) -> String {
   case list.find(model.peer_addrs, fn(pair) { pair.0 == peer_id }) {
     Ok(#(_, _, transport)) -> transport
     Error(_) -> ""
+  }
+}
+
+/// Look up a peer's audio presence.  Returns #(joined, muted).
+fn peer_audio_state(model: Model, peer_id: String) -> #(Bool, Bool) {
+  case list.find(model.peer_audio_states, fn(entry) { entry.0 == peer_id }) {
+    Ok(#(_, joined, muted)) -> #(joined, muted)
+    Error(_) -> #(False, False)
   }
 }
 

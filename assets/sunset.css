@@ -482,6 +482,17 @@ body {
   margin-top: 0.1rem;
 }
 
+.room-peer-audio {
+  font-size: 0.65rem;
+  flex-shrink: 0;
+  margin-left: auto;
+  opacity: 0.7;
+}
+
+.room-peer-audio-muted {
+  opacity: 0.35;
+}
+
 /* Voice controls */
 .room-voice {
   padding: 1rem;

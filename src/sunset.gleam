@@ -60,6 +60,7 @@ fn init(_flags) -> #(Model, Effect(Msg)) {
       audio_joined: False,
       audio_error: "",
       selected_peer: None,
+      peer_audio_states: [],
     )
 
   #(
@@ -147,6 +148,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         start_polling(),
         register_chat_effect(),
         register_signaling_effect(),
+        register_audio_presence_effect(),
       ]
       case new_model.room_name {
         "" -> #(new_model, effect.batch(effects))
@@ -211,7 +213,18 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             _ -> Error(Nil)
           }
         })
+      let raw_audio_states = libp2p.get_peer_audio_states()
+      let peer_audio_states =
+        list.filter_map(raw_audio_states, fn(entry) {
+          case entry {
+            [pid, joined, muted] ->
+              Ok(#(pid, joined == "true", muted == "true"))
+            _ -> Error(Nil)
+          }
+        })
       let peer_count = list.count(peers, fn(pid) { pid != model.peer_id })
+      // Broadcast our audio presence so peers stay in sync.
+      libp2p.broadcast_audio_presence()
       #(
         Model(
           ..model,
@@ -223,6 +236,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           audio_receiving: receiving,
           audio_joined: audio_joined,
           relay_peer_id: relay_id,
+          peer_audio_states: peer_audio_states,
         ),
         schedule_tick(),
       )
@@ -259,27 +273,38 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
 
     UserClickedStartAudio -> {
-      #(Model(..model, audio_error: ""), start_audio_effect())
+      #(
+        Model(..model, audio_error: ""),
+        effect.batch([start_audio_effect(), broadcast_audio_presence_effect()]),
+      )
     }
 
     UserClickedStopAudio -> {
       #(
         Model(..model, audio_sending: False, audio_error: ""),
-        stop_audio_effect(),
+        effect.batch([stop_audio_effect(), broadcast_audio_presence_effect()]),
       )
     }
 
     UserClickedJoinAudio -> {
       #(
         Model(..model, audio_joined: True, audio_error: ""),
-        effect.batch([join_audio_effect(), start_audio_effect()]),
+        effect.batch([
+          join_audio_effect(),
+          start_audio_effect(),
+          broadcast_audio_presence_effect(),
+        ]),
       )
     }
 
     UserClickedLeaveAudio -> {
       #(
         Model(..model, audio_joined: False, audio_sending: False),
-        effect.batch([leave_audio_effect(), stop_audio_effect()]),
+        effect.batch([
+          leave_audio_effect(),
+          stop_audio_effect(),
+          broadcast_audio_presence_effect(),
+        ]),
       )
     }
 
@@ -378,6 +403,14 @@ fn register_chat_effect() -> Effect(Msg) {
 
 fn register_signaling_effect() -> Effect(Msg) {
   effect.from(fn(_dispatch) { libp2p.register_signaling_handler() })
+}
+
+fn register_audio_presence_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) { libp2p.register_audio_presence_handler() })
+}
+
+fn broadcast_audio_presence_effect() -> Effect(Msg) {
+  effect.from(fn(_dispatch) { libp2p.broadcast_audio_presence() })
 }
 
 fn broadcast_effect(msg_text: String) -> Effect(Msg) {

@@ -122,3 +122,18 @@ pub fn dial_peer_addrs(
 ) -> Nil {
   Nil
 }
+
+@external(javascript, "./libp2p.ffi.mjs", "register_audio_presence_handler")
+pub fn register_audio_presence_handler() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "broadcast_audio_presence")
+pub fn broadcast_audio_presence() -> Nil {
+  Nil
+}
+
+@external(javascript, "./libp2p.ffi.mjs", "get_peer_audio_states")
+pub fn get_peer_audio_states() -> List(List(String)) {
+  []
+}

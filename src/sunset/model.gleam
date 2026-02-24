@@ -40,6 +40,7 @@ pub type Model {
     audio_joined: Bool,
     audio_error: String,
     selected_peer: Option(String),
+    peer_audio_states: List(#(String, Bool, Bool)),
   )
 }
 

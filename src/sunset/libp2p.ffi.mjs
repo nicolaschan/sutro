@@ -578,6 +578,75 @@ export function is_audio_joined() {
   return _audioJoined;
 }
 
+// -- Audio presence --
+//
+// Lightweight protocol to tell peers whether we've joined audio and
+// whether our mic is muted.  Each message is a small JSON object:
+//   { "joined": bool, "muted": bool }
+// We send our state to every WebRTC peer whenever it changes and
+// periodically (called from the Gleam Tick) so that newly connected
+// peers learn our state quickly.
+
+const AUDIO_PRESENCE_PROTOCOL = "/sunset/audio-presence/1.0.0";
+const _peerAudioStates = new Map(); // peer ID string -> { joined, muted }
+
+// Register the handler that receives audio presence from remote peers.
+export function register_audio_presence_handler() {
+  if (!_libp2p) return;
+  _libp2p.handle(AUDIO_PRESENCE_PROTOCOL, async (stream, connection) => {
+    try {
+      const text = await readStream(stream);
+      const message = JSON.parse(text);
+      const remotePeerId = connection.remotePeer.toString();
+      _peerAudioStates.set(remotePeerId, {
+        joined: !!message.joined,
+        muted: !!message.muted,
+      });
+    } catch (err) {
+      console.debug("Audio presence handler error:", err.message);
+    }
+  });
+}
+
+// Broadcast our current audio state to all WebRTC peers.
+// Called on every Tick and whenever local audio state changes.
+export function broadcast_audio_presence() {
+  if (!_libp2p) return;
+  const message = {
+    joined: _audioJoined,
+    muted: _audioJoined && !_localStream,
+  };
+  const encoded = new TextEncoder().encode(JSON.stringify(message));
+  for (const { peerId } of getWebRTCPeers()) {
+    _libp2p
+      .dialProtocol(peerId, AUDIO_PRESENCE_PROTOCOL)
+      .then((stream) => {
+        stream.send(encoded);
+        return stream.close();
+      })
+      .catch(() => {
+        // Peer may not support the protocol yet — ignore silently.
+      });
+  }
+}
+
+// Return the audio presence states of all peers as a Gleam-friendly
+// List of [peer_id, joined_string, muted_string].
+export function get_peer_audio_states() {
+  // Clean up entries for peers that are no longer connected.
+  if (_libp2p) {
+    const connectedIds = new Set(_libp2p.getPeers().map((p) => p.toString()));
+    for (const pid of _peerAudioStates.keys()) {
+      if (!connectedIds.has(pid)) _peerAudioStates.delete(pid);
+    }
+  }
+  const results = [];
+  for (const [pid, state] of _peerAudioStates) {
+    results.push(toList([pid, state.joined ? "true" : "false", state.muted ? "true" : "false"]));
+  }
+  return toList(results);
+}
+
 // -- Room-based peer discovery via relay --
 //
 // The relay runs a custom request-response protocol (/sunset/discovery/1.0.0).
