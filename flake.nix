@@ -54,9 +54,7 @@
           name = "sunset-dist";
           src = fs.toSource {
             root = ./.;
-            fileset = fs.difference (fs.gitTracked ./.) (fs.unions [
-              ./relay ./.github ./test ./nix
-            ]);
+            fileset = fs.gitTracked ./.;
           };
           manifest = ./manifest.toml;
           target = "javascript";
@@ -116,6 +114,25 @@
         apps = {
           default = { type = "app"; program = "${self.packages.${system}.default}/bin/sunset"; meta.description = "Sunset production server"; };
           dev = { type = "app"; program = "${self.packages.${system}.dev}/bin/sunset-dev"; meta.description = "Sunset dev server with live reload"; };
+        };
+
+        checks.unit = gleamLib.buildGleamPackage {
+          name = "sunset-unit-tests";
+          src = fs.toSource {
+            root = ./.;
+            fileset = fs.gitTracked ./.;
+          };
+          manifest = ./manifest.toml;
+          target = "javascript";
+          nativeBuildInputs = [ pkgs.npmHooks.npmConfigHook ];
+          npmDeps = appNpmDeps;
+          npmRebuildFlags = [ "--ignore-scripts" ];
+          buildPhase = ''
+            runHook preBuild
+            gleam test
+            runHook postBuild
+          '';
+          installPhase = "touch $out";
         };
 
         checks.integration = pkgs.testers.nixosTest {
