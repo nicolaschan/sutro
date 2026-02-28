@@ -217,6 +217,8 @@ let _localStream = null; // MediaStream from getUserMedia
 // Acquire the microphone. Does NOT create any peer connections.
 // Calls on_ok() on success, on_error(msg) on failure.
 // If already acquired, just re-enables tracks (unmute).
+// When newly acquired, adds the local track to any existing PCs
+// that were created before the mic was ready, and renegotiates.
 export function acquire_microphone(on_ok, on_error) {
   if (_localStream) {
     for (const track of _localStream.getAudioTracks()) {
@@ -227,8 +229,47 @@ export function acquire_microphone(on_ok, on_error) {
   }
   navigator.mediaDevices
     .getUserMedia({ audio: true, video: false })
-    .then((stream) => {
+    .then(async (stream) => {
       _localStream = stream;
+      const track = stream.getAudioTracks()[0];
+      if (track) {
+        // Add the track to all existing PCs that don't have a local track yet
+        for (const [pid, pc] of _audioPCs) {
+          const senders = pc.getSenders();
+          const hasAudioSender = senders.some(
+            (s) => s.track && s.track.kind === "audio"
+          );
+          if (!hasAudioSender) {
+            // Find a recvonly transceiver to upgrade, or add a new track
+            const recvOnly = pc.getTransceivers().find(
+              (t) => t.receiver.track?.kind === "audio" && t.direction === "recvonly"
+            );
+            if (recvOnly) {
+              recvOnly.direction = "sendrecv";
+              recvOnly.sender.replaceTrack(track);
+            } else {
+              pc.addTrack(track, stream);
+            }
+            console.log(`[Audio ${pid.slice(-8)}] Added local track after mic acquired`);
+
+            // Renegotiate so the remote peer knows we're now sending
+            const remotePeerId = _findPeerId(pid);
+            if (remotePeerId && pc.signalingState === "stable") {
+              try {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                await sendAudioSignaling(remotePeerId, {
+                  type: "offer",
+                  sdp: pc.localDescription.sdp,
+                });
+                console.log(`[Audio ${pid.slice(-8)}] Renegotiated after adding track`);
+              } catch (err) {
+                console.warn(`[Audio ${pid.slice(-8)}] Renegotiation failed:`, err.message);
+              }
+            }
+          }
+        }
+      }
       on_ok();
     })
     .catch((err) => {
@@ -343,21 +384,35 @@ const STUN_SERVERS = [
 const _audioPCs = new Map(); // peer ID string -> RTCPeerConnection
 
 // Send an audio signaling message to a peer via libp2p stream.
-async function sendAudioSignaling(remotePeerId, message) {
+// Retries with exponential backoff on transient failures (e.g. "no valid addresses").
+async function sendAudioSignaling(remotePeerId, message, retries = 3) {
   const encoded = new TextEncoder().encode(JSON.stringify(message));
-  try {
-    const stream = await _libp2p.dialProtocol(
-      remotePeerId,
-      AUDIO_SIGNALING_PROTOCOL,
-      { runOnLimitedConnection: true }
-    );
-    await stream.send(encoded);
-    await stream.close();
-  } catch (err) {
-    console.warn(
-      `[AudioSignaling] Send failed to ${remotePeerId.toString().slice(-8)}:`,
-      err.message
-    );
+  const peerTag = remotePeerId.toString().slice(-8);
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const stream = await _libp2p.dialProtocol(
+        remotePeerId,
+        AUDIO_SIGNALING_PROTOCOL,
+        { runOnLimitedConnection: true }
+      );
+      await stream.send(encoded);
+      await stream.close();
+      return; // success
+    } catch (err) {
+      if (attempt < retries) {
+        const delay = 500 * Math.pow(2, attempt); // 500, 1000, 2000ms
+        console.warn(
+          `[AudioSignaling] Send to ${peerTag} failed (attempt ${attempt + 1}/${retries + 1}), retry in ${delay}ms:`,
+          err.message
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      } else {
+        console.warn(
+          `[AudioSignaling] Send to ${peerTag} failed after ${retries + 1} attempts:`,
+          err.message
+        );
+      }
+    }
   }
 }
 
@@ -366,9 +421,15 @@ async function sendAudioSignaling(remotePeerId, message) {
 // state changes, so Gleam can react (schedule reconnects, etc).
 // audio_muted: whether remote audio elements should start muted.
 export function create_audio_pc(peer_id_str, should_offer, audio_muted, on_state_change) {
-  // Close existing PC for this peer if any
+  // Skip if we already have a healthy PC for this peer
   const oldPC = _audioPCs.get(peer_id_str);
   if (oldPC) {
+    const state = oldPC.connectionState;
+    if (state === "connected" || state === "connecting") {
+      console.log(`[Audio ${peer_id_str.slice(-8)}] Keeping existing PC (state=${state})`);
+      return;
+    }
+    // Close unhealthy PC
     oldPC.close();
     _audioPCs.delete(peer_id_str);
     removeRemoteAudioFor(peer_id_str);
@@ -423,12 +484,16 @@ export function create_audio_pc(peer_id_str, should_offer, audio_muted, on_state
     console.log(`[Audio ${peer_id_str.slice(-8)}] ICE: ${pc.iceConnectionState}`);
   });
 
-  // Add local audio track if we have one
+  // Add local audio track if we have one, otherwise add a recvonly
+  // transceiver so the SDP offer includes an m=audio line.
+  // Without a media section, ICE gathering never starts.
   if (_localStream) {
     const track = _localStream.getAudioTracks()[0];
     if (track) {
       pc.addTrack(track, _localStream);
     }
+  } else {
+    pc.addTransceiver("audio", { direction: "recvonly" });
   }
 
   // If we're the offerer, create and send the SDP offer
@@ -554,12 +619,15 @@ export function register_audio_signaling_handler(audio_muted, on_state_change, o
               console.log(`[Audio ${peerIdStr.slice(-8)}] ICE: ${pc.iceConnectionState}`);
             });
 
-            // Add local audio track if we have one
+            // Add local audio track if we have one, otherwise add a
+            // recvonly transceiver so the SDP answer includes audio.
             if (_localStream) {
               const track = _localStream.getAudioTracks()[0];
               if (track) {
                 pc.addTrack(track, _localStream);
               }
+            } else {
+              pc.addTransceiver("audio", { direction: "recvonly" });
             }
           }
 

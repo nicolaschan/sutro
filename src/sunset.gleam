@@ -965,12 +965,17 @@ fn reconcile_audio_pcs(model: Model, peers: List(String)) -> Effect(Msg) {
               case peer_in_audio {
                 False -> Error(Nil)
                 True -> {
-                  // Check if we already have a healthy PC
+                  // Check if we already have a healthy PC.
+                  // "new" is treated as unhealthy — it means the offer
+                  // was never delivered (signaling failed).
                   let has_pc = case
                     list.find(model.audio_pc_states, fn(e) { e.0 == pid })
                   {
-                    Ok(#(_, s)) -> s != "failed" && s != "closed"
-                    Error(_) -> libp2p.has_audio_pc(pid)
+                    Ok(#(_, s)) ->
+                      s == "connected"
+                      || s == "connecting"
+                      || s == "have-local-offer"
+                    Error(_) -> False
                   }
                   case has_pc {
                     True -> Error(Nil)

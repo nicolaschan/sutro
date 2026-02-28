@@ -24,29 +24,15 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: "28"
-          gleam-version: "1.14.0"
-          rebar3-version: "3"
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
 
-      - name: Install app dependencies
-        run: npm ci
-
-      - name: Download Gleam dependencies
-        run: gleam deps download
-
-      - name: Build app
-        run: gleam run -m lustre/dev build sunset --minify
-
-      - name: Build relay
-        id: relay
-        run: echo "bin=$(nix build ./relay#default --no-link --print-out-paths)/bin/relay" >> "$GITHUB_OUTPUT"
+      - name: Build app and relay
+        id: build
+        run: |
+          echo "dist=$(nix build .#sunsetDist --no-link --print-out-paths)" >> "$GITHUB_OUTPUT"
+          echo "relay=$(nix build ./relay#default --no-link --print-out-paths)/bin/relay" >> "$GITHUB_OUTPUT"
 
       - name: Install integration test dependencies
         run: npm ci
@@ -56,4 +42,5 @@ jobs:
         run: npm test
         working-directory: test/integration
         env:
-          RELAY_BIN: ${{ steps.relay.outputs.bin }}
+          SUNSET_DIST_DIR: ${{ steps.build.outputs.dist }}
+          SUNSET_RELAY_BIN: ${{ steps.build.outputs.relay }}

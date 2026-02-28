@@ -17,34 +17,34 @@ import {
 } from "./helpers.mjs";
 
 let env; // { appUrl, relayMultiaddr }
-let browserA, browserB;
-let pageA, pageB;
 
 // Generate unique room names to avoid collisions between test runs
 function uniqueRoom(prefix = "test") {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-describe("Sunset Integration Tests", () => {
+describe("Sunset Integration Tests", { concurrency: true }, () => {
   before(async () => {
     env = await setup();
-    [browserA, browserB] = await Promise.all([
-      launchBrowser(),
-      launchBrowser(),
-    ]);
   });
 
   after(async () => {
-    await Promise.all([
-      browserA?.close(),
-      browserB?.close(),
-    ]);
     await teardown();
   });
 
   describe("Home page", () => {
+    let browser;
+
+    before(async () => {
+      browser = await launchBrowser();
+    });
+
+    after(async () => {
+      await browser?.close();
+    });
+
     it("should display the landing page with room join form", async () => {
-      const page = await openApp(browserA, env.appUrl, env.relayMultiaddr);
+      const page = await openApp(browser, env.appUrl, env.relayMultiaddr);
       const title = await page.$eval(".landing-title", (el) => el.textContent);
       assert.equal(title, "Sunset Chat");
 
@@ -59,8 +59,18 @@ describe("Sunset Integration Tests", () => {
   });
 
   describe("Room — empty state", () => {
+    let browser;
+
+    before(async () => {
+      browser = await launchBrowser();
+    });
+
+    after(async () => {
+      await browser?.close();
+    });
+
     it("should show empty message state when entering a room", async () => {
-      const page = await openApp(browserA, env.appUrl, env.relayMultiaddr);
+      const page = await openApp(browser, env.appUrl, env.relayMultiaddr);
       const room = uniqueRoom("empty");
       await joinRoom(page, room);
 
@@ -78,9 +88,16 @@ describe("Sunset Integration Tests", () => {
   });
 
   describe("Two-instance chat", () => {
+    let browserA, browserB;
+    let pageA, pageB;
     const room = uniqueRoom("chat");
 
     before(async () => {
+      [browserA, browserB] = await Promise.all([
+        launchBrowser(),
+        launchBrowser(),
+      ]);
+
       // Open fresh pages for both browsers
       pageA = await openApp(browserA, env.appUrl, env.relayMultiaddr);
       pageB = await openApp(browserB, env.appUrl, env.relayMultiaddr);
@@ -102,8 +119,7 @@ describe("Sunset Integration Tests", () => {
     });
 
     after(async () => {
-      await pageA?.close();
-      await pageB?.close();
+      await Promise.all([browserA?.close(), browserB?.close()]);
     });
 
     it("should show each other as connected peers", async () => {
@@ -147,6 +163,19 @@ describe("Sunset Integration Tests", () => {
   });
 
   describe("Display names", () => {
+    let browserA, browserB;
+
+    before(async () => {
+      [browserA, browserB] = await Promise.all([
+        launchBrowser(),
+        launchBrowser(),
+      ]);
+    });
+
+    after(async () => {
+      await Promise.all([browserA?.close(), browserB?.close()]);
+    });
+
     it("should show sender display name on the receiving side", async () => {
       const room = uniqueRoom("names");
       const pA = await openApp(browserA, env.appUrl, env.relayMultiaddr);
@@ -180,6 +209,19 @@ describe("Sunset Integration Tests", () => {
   });
 
   describe("Room isolation", () => {
+    let browserA, browserB;
+
+    before(async () => {
+      [browserA, browserB] = await Promise.all([
+        launchBrowser(),
+        launchBrowser(),
+      ]);
+    });
+
+    after(async () => {
+      await Promise.all([browserA?.close(), browserB?.close()]);
+    });
+
     it("should NOT see messages from a different room", async () => {
       const roomX = uniqueRoom("room-x");
       const roomY = uniqueRoom("room-y");

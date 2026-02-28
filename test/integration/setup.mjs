@@ -1,63 +1,51 @@
-// setup.mjs — Build app + relay, start servers for integration tests.
+// setup.mjs — Start servers for integration tests.
+//
+// Requires two environment variables pointing to pre-built artifacts:
+//   SUNSET_DIST_DIR  — path to the built frontend dist directory
+//   SUNSET_RELAY_BIN — path to the relay binary
+//
+// Build them with Nix:
+//   nix build .#sunsetDist --out-link dist-result
+//   nix build ./relay --out-link relay-result
+// Then:
+//   SUNSET_DIST_DIR=./dist-result SUNSET_RELAY_BIN=./relay-result/bin/relay npm test
 
 import { createServer } from "node:http";
-import { execSync, spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import handler from "serve-handler";
 
-const ROOT = resolve(import.meta.dirname, "..", "..");
+// ── Configuration ──────────────────────────────────────────────────
 
-// ── Build ──────────────────────────────────────────────────────────
-
-function buildApp() {
-  if (process.env.SUNSET_DIST_DIR) {
-    console.log(`[setup] Using pre-built dist: ${process.env.SUNSET_DIST_DIR}`);
-    return;
+function requireEnv(name, altNames = []) {
+  for (const n of [name, ...altNames]) {
+    if (process.env[n]) return process.env[n];
   }
-  const distDir = join(ROOT, "dist");
-  if (existsSync(join(distDir, "index.html"))) {
-    console.log("[setup] App already built (dist/index.html exists), skipping.");
-    return;
-  }
-  console.log("[setup] Building Gleam app...");
-  execSync("gleam run -m lustre/dev build sunset --minify", {
-    cwd: ROOT,
-    stdio: "inherit",
-  });
-  console.log("[setup] App built.");
+  const names = [name, ...altNames].join(" or ");
+  throw new Error(
+    `Missing environment variable: ${names}\n` +
+    `Build the artifacts with Nix first:\n` +
+    `  nix build .#sunsetDist --out-link dist-result\n` +
+    `  nix build ./relay --out-link relay-result\n` +
+    `Then run:\n` +
+    `  SUNSET_DIST_DIR=./dist-result SUNSET_RELAY_BIN=./relay-result/bin/relay npm test`
+  );
 }
 
 function getDistDir() {
-  return process.env.SUNSET_DIST_DIR || join(ROOT, "dist");
+  return requireEnv("SUNSET_DIST_DIR");
 }
 
-function buildRelay() {
-  if (process.env.SUNSET_RELAY_BIN) {
-    console.log(`[setup] Using pre-built relay: ${process.env.SUNSET_RELAY_BIN}`);
-    return process.env.SUNSET_RELAY_BIN;
-  }
-  if (process.env.RELAY_BIN) {
-    const relayBin = process.env.RELAY_BIN;
-    console.log(`[setup] Using pre-built relay binary: ${relayBin}`);
-    return relayBin;
-  }
-  console.log("[setup] Building relay via nix...");
-  const out = execSync("nix build ./relay#default --no-link --print-out-paths", {
-    cwd: ROOT,
-    encoding: "utf-8",
-  }).trim();
-  const relayBin = join(out, "bin", "relay");
-  console.log(`[setup] Relay binary: ${relayBin}`);
-  return relayBin;
+function getRelayBin() {
+  return requireEnv("SUNSET_RELAY_BIN", ["RELAY_BIN"]);
 }
 
 // ── Static file server ─────────────────────────────────────────────
 
-function startStaticServer() {
+function startStaticServer(distDir) {
   return new Promise((resolve, reject) => {
-    const distDir = getDistDir();
     const server = createServer((req, res) =>
       handler(req, res, { public: distDir })
     );
@@ -137,11 +125,13 @@ let _state = null;
 export async function setup() {
   if (_state) return _state;
 
-  buildApp();
-  const relayBin = buildRelay();
+  const distDir = getDistDir();
+  const relayBin = getRelayBin();
+  console.log(`[setup] Dist dir: ${distDir}`);
+  console.log(`[setup] Relay bin: ${relayBin}`);
 
   const [staticServer, relay] = await Promise.all([
-    startStaticServer(),
+    startStaticServer(distDir),
     startRelay(relayBin),
   ]);
 

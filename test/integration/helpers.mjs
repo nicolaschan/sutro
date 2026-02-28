@@ -337,9 +337,12 @@ export async function isAudioJoined(page) {
  * Check whether any received audio stream has non-silent content.
  * Uses the Web Audio API AnalyserNode to measure RMS energy and
  * returns true if the level exceeds a silence threshold.
+ *
+ * Waits briefly inside the browser for the analyser to accumulate
+ * at least one buffer of real samples before reading.
  */
 export async function isReceivingNonSilentAudio(page) {
-  return page.evaluate(() => {
+  return page.evaluate(async () => {
     const audios = document.querySelectorAll("audio");
     for (const audio of audios) {
       if (!audio.srcObject) continue;
@@ -351,6 +354,9 @@ export async function isReceivingNonSilentAudio(page) {
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
       source.connect(analyser);
+
+      // Wait for the analyser to process some audio frames
+      await new Promise((r) => setTimeout(r, 200));
 
       const data = new Float32Array(analyser.fftSize);
       analyser.getFloatTimeDomainData(data);

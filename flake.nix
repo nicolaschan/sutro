@@ -122,6 +122,18 @@
         apps = {
           default = { type = "app"; program = "${self.packages.${system}.default}/bin/sunset"; meta.description = "Sunset production server"; };
           dev = { type = "app"; program = "${self.packages.${system}.dev}/bin/sunset-dev"; meta.description = "Sunset dev server with live reload"; };
+          integration-test = {
+            type = "app";
+            program = "${pkgs.writeShellScript "integration-test" ''
+              set -euo pipefail
+              export PATH="${pkgs.lib.makeBinPath [ pkgs.nodejs ]}:$PATH"
+              export SUNSET_DIST_DIR="${sunsetDist}"
+              export SUNSET_RELAY_BIN="${relayPkg}/bin/relay"
+              cd ${integrationTestSrc}
+              exec ${pkgs.nodejs}/bin/node --test --test-reporter=spec --test-concurrency=2 --test-timeout=120000 "$@"
+            ''}";
+            meta.description = "Run integration tests locally (no VM)";
+          };
         };
 
         checks.unit = gleamLib.buildGleamPackage {
@@ -160,7 +172,7 @@
               "SUNSET_DIST_DIR=${sunsetDist} "
               "SUNSET_RELAY_BIN=${relayPkg}/bin/relay "
               "PUPPETEER_EXECUTABLE_PATH=${pkgs.chromium}/bin/chromium "
-              "node --test --test-timeout=120000 chat.test.mjs "
+              "node --test --test-concurrency=2 --test-timeout=120000 *.test.mjs "
               "2>&1 | tee /tmp/test-output.log"
             )
           '';

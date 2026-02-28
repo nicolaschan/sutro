@@ -29,7 +29,7 @@ function uniqueRoom(prefix = "audio") {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-describe("Sunset Audio Integration Tests", () => {
+describe("Sunset Audio Integration Tests", { concurrency: true }, () => {
   before(async () => {
     env = await setup();
   });
