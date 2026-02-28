@@ -87,6 +87,14 @@
           npmDeps = testNpmDeps;
         };
 
+        integrationTestSrc = pkgs.runCommand "sunset-integration-test-src" {} ''
+          mkdir -p $out
+          for f in ${./test/integration}/*.mjs ${./test/integration}/package.json ${./test/integration}/test-tone.wav; do
+            cp "$f" $out/
+          done
+          ln -s ${testNodeModules}/node_modules $out/node_modules
+        '';
+
       in
       {
         devShells.default = pkgs.mkShell {
@@ -144,18 +152,11 @@
             networking.firewall.enable = false;
           };
 
-          testScript = let testSrc = ./test/integration; in ''
+          testScript = ''
             machine.wait_for_unit("multi-user.target")
 
-            machine.succeed("mkdir -p /tmp/integration")
-            machine.succeed("cp ${testSrc}/chat.test.mjs /tmp/integration/")
-            machine.succeed("cp ${testSrc}/helpers.mjs /tmp/integration/")
-            machine.succeed("cp ${testSrc}/setup.mjs /tmp/integration/")
-            machine.succeed("cp ${testSrc}/package.json /tmp/integration/")
-            machine.succeed("ln -sf ${testNodeModules}/node_modules /tmp/integration/node_modules")
-
             machine.succeed(
-              "cd /tmp/integration && "
+              "cd ${integrationTestSrc} && "
               "SUNSET_DIST_DIR=${sunsetDist} "
               "SUNSET_RELAY_BIN=${relayPkg}/bin/relay "
               "PUPPETEER_EXECUTABLE_PATH=${pkgs.chromium}/bin/chromium "

@@ -2,6 +2,11 @@
 
 import puppeteer from "puppeteer";
 import { execSync } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const TEST_TONE_PATH = path.join(__dirname, "test-tone.wav");
 
 // ── Browser lifecycle ──────────────────────────────────────────────
 
@@ -43,6 +48,7 @@ export async function launchBrowser() {
       "--disable-dev-shm-usage",
       "--use-fake-ui-for-media-stream",
       "--use-fake-device-for-media-stream",
+      `--use-file-for-fake-audio-capture=${TEST_TONE_PATH}`,
       "--disable-web-security",
       // Allow WebRTC on localhost
       "--allow-running-insecure-content",
@@ -180,4 +186,201 @@ export async function getConnectedPeerCount(page) {
     const match = header.textContent.match(/Connected \((\d+)\)/);
     return match ? parseInt(match[1], 10) : 0;
   });
+}
+
+// ── Audio helpers ──────────────────────────────────────────────────
+
+/**
+ * Click the "Join audio" button to join the audio session.
+ */
+export async function joinAudio(page) {
+  await page.waitForSelector(".room-voice-btn", { timeout: 10_000 });
+  await page.click(".room-voice-btn");
+  // Wait for the button to change to "Leave audio" (active state)
+  await page.waitForSelector(".room-voice-btn-active", { timeout: 15_000 });
+}
+
+/**
+ * Click the "Leave audio" button to leave the audio session.
+ */
+export async function leaveAudio(page) {
+  await page.waitForSelector(".room-voice-btn-active", { timeout: 10_000 });
+  await page.click(".room-voice-btn-active");
+  // Wait for the button to revert to non-active (Join audio)
+  await page.waitForFunction(
+    () => {
+      const btn = document.querySelector(".room-voice-btn");
+      return btn && !btn.classList.contains("room-voice-btn-active");
+    },
+    { timeout: 15_000 }
+  );
+}
+
+/**
+ * Wait until a peer's audio RTC peer connection dot shows "connected"
+ * (green dot with class room-peer-dot-rtc-connected) for at least
+ * `count` peers.
+ */
+export async function waitForAudioConnected(page, count, timeout = 60_000) {
+  await page.waitForFunction(
+    (expectedCount) => {
+      const dots = document.querySelectorAll(".room-peer-dot-rtc-connected");
+      return dots.length >= expectedCount;
+    },
+    { timeout },
+    count
+  );
+}
+
+/**
+ * Check whether the page is receiving live remote audio.
+ * Evaluates in the browser context using the hidden <audio> elements.
+ */
+export async function isReceivingAudio(page) {
+  return page.evaluate(() => {
+    const audios = document.querySelectorAll("audio");
+    for (const audio of audios) {
+      if (!audio.srcObject) continue;
+      const tracks = audio.srcObject.getAudioTracks();
+      if (tracks.some((t) => t.readyState === "live")) return true;
+    }
+    return false;
+  });
+}
+
+/**
+ * Wait until the page is receiving live remote audio from at least one peer.
+ */
+export async function waitForReceivingAudio(page, timeout = 60_000) {
+  await page.waitForFunction(
+    () => {
+      const audios = document.querySelectorAll("audio");
+      for (const audio of audios) {
+        if (!audio.srcObject) continue;
+        const tracks = audio.srcObject.getAudioTracks();
+        if (tracks.some((t) => t.readyState === "live")) return true;
+      }
+      return false;
+    },
+    { timeout }
+  );
+}
+
+/**
+ * Wait until the page is NOT receiving any live remote audio.
+ */
+export async function waitForNotReceivingAudio(page, timeout = 30_000) {
+  await page.waitForFunction(
+    () => {
+      const audios = document.querySelectorAll("audio");
+      for (const audio of audios) {
+        if (!audio.srcObject) continue;
+        const tracks = audio.srcObject.getAudioTracks();
+        if (tracks.some((t) => t.readyState === "live")) return false;
+      }
+      return true;
+    },
+    { timeout }
+  );
+}
+
+/**
+ * Get the number of active audio peer connections (hidden <audio>
+ * elements with a live srcObject).
+ */
+export async function getActiveAudioStreamCount(page) {
+  return page.evaluate(() => {
+    let count = 0;
+    const audios = document.querySelectorAll("audio");
+    for (const audio of audios) {
+      if (!audio.srcObject) continue;
+      const tracks = audio.srcObject.getAudioTracks();
+      if (tracks.some((t) => t.readyState === "live")) count++;
+    }
+    return count;
+  });
+}
+
+/**
+ * Wait until the page has exactly `count` active audio streams
+ * (hidden <audio> elements with live tracks).
+ */
+export async function waitForActiveAudioStreams(page, count, timeout = 60_000) {
+  await page.waitForFunction(
+    (expectedCount) => {
+      let actual = 0;
+      const audios = document.querySelectorAll("audio");
+      for (const audio of audios) {
+        if (!audio.srcObject) continue;
+        const tracks = audio.srcObject.getAudioTracks();
+        if (tracks.some((t) => t.readyState === "live")) actual++;
+      }
+      return actual >= expectedCount;
+    },
+    { timeout },
+    count
+  );
+}
+
+/**
+ * Check if the "Join audio" / "Leave audio" button shows joined state.
+ */
+export async function isAudioJoined(page) {
+  return page.evaluate(() => {
+    return !!document.querySelector(".room-voice-btn-active");
+  });
+}
+
+// ── Non-silent audio detection ─────────────────────────────────────
+
+/**
+ * Check whether any received audio stream has non-silent content.
+ * Uses the Web Audio API AnalyserNode to measure RMS energy and
+ * returns true if the level exceeds a silence threshold.
+ */
+export async function isReceivingNonSilentAudio(page) {
+  return page.evaluate(() => {
+    const audios = document.querySelectorAll("audio");
+    for (const audio of audios) {
+      if (!audio.srcObject) continue;
+      const tracks = audio.srcObject.getAudioTracks();
+      if (!tracks.some((t) => t.readyState === "live")) continue;
+
+      const ctx = new AudioContext();
+      const source = ctx.createMediaStreamSource(audio.srcObject);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+
+      const data = new Float32Array(analyser.fftSize);
+      analyser.getFloatTimeDomainData(data);
+
+      let sumSq = 0;
+      for (let i = 0; i < data.length; i++) {
+        sumSq += data[i] * data[i];
+      }
+      const rms = Math.sqrt(sumSq / data.length);
+
+      source.disconnect();
+      ctx.close();
+
+      // Threshold: anything above -60 dBFS (~0.001 RMS) is non-silent
+      if (rms > 0.001) return true;
+    }
+    return false;
+  });
+}
+
+/**
+ * Wait until the page is receiving non-silent audio from at least one peer.
+ * Polls periodically because the AnalyserNode needs time to accumulate data.
+ */
+export async function waitForNonSilentAudio(page, timeout = 60_000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const nonSilent = await isReceivingNonSilentAudio(page);
+    if (nonSilent) return;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`Timed out after ${timeout}ms waiting for non-silent audio`);
 }
