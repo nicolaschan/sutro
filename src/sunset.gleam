@@ -254,6 +254,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let peer_count = list.count(peers, fn(pid) { pid != model.peer_id })
       // Broadcast our audio presence so peers stay in sync.
       libp2p.broadcast_audio_presence()
+      // Ensure we have audio PCs for all peers that are in audio.
+      libp2p.reconcile_audio_pcs()
       #(
         Model(
           ..model,

@@ -243,8 +243,8 @@ const STUN_SERVERS = [
 const _audioPCs = new Map(); // peer ID string -> RTCPeerConnection
 const _audioReconnectTimers = new Map(); // peer ID string -> timeout ID
 const _audioReconnectCounts = new Map(); // peer ID string -> number of attempts so far
-const AUDIO_RECONNECT_MAX_ATTEMPTS = 5;
-const AUDIO_RECONNECT_BASE_DELAY_MS = 1000; // 1s, 2s, 4s, 8s, 16s
+const AUDIO_RECONNECT_BASE_DELAY_MS = 1000; // 1s, 2s, 4s, 8s, ...
+const AUDIO_RECONNECT_MAX_DELAY_MS = 30_000; // cap at 30s
 
 // Send an audio signaling message to a peer via libp2p stream.
 // Fire-and-forget: one stream per message.
@@ -416,7 +416,7 @@ function closeAudioPC(peerIdStr, resetReconnect = true) {
 }
 
 // Schedule a reconnect attempt for a failed/disconnected audio PC.
-// Uses exponential backoff: 1s, 2s, 4s, 8s, 16s then gives up.
+// Uses exponential backoff: 1s, 2s, 4s, ... capped at 30s, retries indefinitely.
 function scheduleAudioReconnect(peerIdStr) {
   // Don't reconnect if we're not in audio mode
   if (!_audioJoined || !_localStream) return;
@@ -431,19 +431,14 @@ function scheduleAudioReconnect(peerIdStr) {
     _audioReconnectTimers.delete(peerIdStr);
   }
 
-  if (attempt > AUDIO_RECONNECT_MAX_ATTEMPTS) {
-    console.warn(
-      `[Audio ${peerIdStr.slice(-8)}] Giving up reconnect after ${AUDIO_RECONNECT_MAX_ATTEMPTS} attempts`,
-    );
-    _audioReconnectCounts.delete(peerIdStr);
-    return;
-  }
-
   _audioReconnectCounts.set(peerIdStr, attempt);
 
-  const delay = AUDIO_RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+  const delay = Math.min(
+    AUDIO_RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt - 1),
+    AUDIO_RECONNECT_MAX_DELAY_MS,
+  );
   console.log(
-    `[Audio ${peerIdStr.slice(-8)}] Scheduling reconnect attempt ${attempt}/${AUDIO_RECONNECT_MAX_ATTEMPTS} in ${delay}ms`,
+    `[Audio ${peerIdStr.slice(-8)}] Scheduling reconnect attempt ${attempt} in ${delay}ms`,
   );
 
   const timer = setTimeout(() => {
@@ -475,6 +470,20 @@ function attemptAudioReconnect(peerIdStr) {
     console.log(
       `[Audio ${peerIdStr.slice(-8)}] Reconnect skipped: peer not connected via libp2p`,
     );
+    // Peer is gone — schedule another attempt in case they come back.
+    // Don't increment the counter so we keep the current backoff level.
+    scheduleAudioReconnect(peerIdStr);
+    return;
+  }
+
+  // If the peer's audio presence says they haven't joined audio, defer.
+  const peerState = _peerAudioStates.get(peerIdStr);
+  if (peerState && !peerState.joined) {
+    console.log(
+      `[Audio ${peerIdStr.slice(-8)}] Reconnect skipped: peer not in audio`,
+    );
+    // Schedule another attempt — they may rejoin later.
+    scheduleAudioReconnect(peerIdStr);
     return;
   }
 
@@ -602,6 +611,10 @@ export function register_audio_signaling_handler() {
             `[AudioSignaling] Bye from ${peerIdStr.slice(-8)}`,
           );
           closeAudioPC(peerIdStr);
+          // If we're still in audio, schedule a reconnect so we re-establish
+          // the connection when the peer comes back to audio (or if the bye
+          // was caused by a transient error on their side).
+          scheduleAudioReconnect(peerIdStr);
         } else {
           console.warn(
             `[AudioSignaling] Unknown message type: ${message.type}`,
@@ -624,6 +637,36 @@ export function get_audio_pc_states() {
     results.push(toList([pid, pc.connectionState]));
   }
   return toList(results);
+}
+
+// Reconcile audio PCs: ensure we have an active PC (or a pending reconnect)
+// for every connected peer that has joined audio.  Called on each tick.
+export function reconcile_audio_pcs() {
+  if (!_audioJoined || !_localStream || !_libp2p) return;
+
+  const relayPeerId = _getRelayPeerId();
+  const relayStr = relayPeerId ? relayPeerId.toString() : null;
+
+  for (const peerId of _libp2p.getPeers()) {
+    const peerIdStr = peerId.toString();
+    if (peerIdStr === relayStr) continue;
+
+    // Check if the peer has joined audio via presence
+    const peerState = _peerAudioStates.get(peerIdStr);
+    if (!peerState || !peerState.joined) continue;
+
+    // Already have a live PC? Skip.
+    const pc = _audioPCs.get(peerIdStr);
+    if (pc && pc.connectionState !== "failed" && pc.connectionState !== "closed") continue;
+
+    // Already have a reconnect scheduled? Skip.
+    if (_audioReconnectTimers.has(peerIdStr)) continue;
+
+    console.log(
+      `[Audio ${peerIdStr.slice(-8)}] Reconcile: peer is in audio but no active PC — scheduling reconnect`,
+    );
+    scheduleAudioReconnect(peerIdStr);
+  }
 }
 
 // Get or create a hidden <audio> element for a remote peer.
