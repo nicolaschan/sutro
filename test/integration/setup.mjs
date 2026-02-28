@@ -12,6 +12,10 @@ const ROOT = resolve(import.meta.dirname, "..", "..");
 // ── Build ──────────────────────────────────────────────────────────
 
 function buildApp() {
+  if (process.env.SUNSET_DIST_DIR) {
+    console.log(`[setup] Using pre-built dist: ${process.env.SUNSET_DIST_DIR}`);
+    return;
+  }
   const distDir = join(ROOT, "dist");
   if (existsSync(join(distDir, "index.html"))) {
     console.log("[setup] App already built (dist/index.html exists), skipping.");
@@ -25,7 +29,15 @@ function buildApp() {
   console.log("[setup] App built.");
 }
 
+function getDistDir() {
+  return process.env.SUNSET_DIST_DIR || join(ROOT, "dist");
+}
+
 function buildRelay() {
+  if (process.env.SUNSET_RELAY_BIN) {
+    console.log(`[setup] Using pre-built relay: ${process.env.SUNSET_RELAY_BIN}`);
+    return process.env.SUNSET_RELAY_BIN;
+  }
   if (process.env.RELAY_BIN) {
     const relayBin = process.env.RELAY_BIN;
     console.log(`[setup] Using pre-built relay binary: ${relayBin}`);
@@ -45,13 +57,13 @@ function buildRelay() {
 
 function startStaticServer() {
   return new Promise((resolve, reject) => {
-    const distDir = join(ROOT, "dist");
+    const distDir = getDistDir();
     const server = createServer((req, res) =>
       handler(req, res, { public: distDir })
     );
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
-      console.log(`[setup] Static server on http://127.0.0.1:${port}`);
+      console.log(`[setup] Static server on http://127.0.0.1:${port} (serving ${distDir})`);
       resolve({ server, port });
     });
     server.on("error", reject);

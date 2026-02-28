@@ -7,10 +7,14 @@ import { execSync } from "node:child_process";
 
 /**
  * Find a Chrome/Chromium executable.
- * Prefers system-installed chromium (works on NixOS), falls back to
+ * Checks PUPPETEER_EXECUTABLE_PATH env var first, then prefers
+ * system-installed chromium (works on NixOS), falls back to
  * Puppeteer's bundled Chrome.
  */
 function findChromePath() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
   for (const name of ["chromium", "google-chrome", "google-chrome-stable"]) {
     try {
       const path = execSync(`which ${name}`, { encoding: "utf-8" }).trim();
@@ -35,6 +39,8 @@ export async function launchBrowser() {
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
       "--use-fake-ui-for-media-stream",
       "--use-fake-device-for-media-stream",
       "--disable-web-security",

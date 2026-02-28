@@ -8,6 +8,15 @@ on:
   pull_request:
 
 jobs:
+  flake-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: nix flake check --no-build
+
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 30
